@@ -1,0 +1,4 @@
+opencv-python>=4.8   # green_minifig_tracker.py -- camera capture, HSV color masking, preview windows
+numpy>=1.24           # green_minifig_tracker.py -- mask/array math
+ultralytics>=8.1       # green_minifig_tracker.py -- YOLO object detection
+paho-mqtt>=2.0          # green_minifig_tracker.py -- publishes minifig position to the UnoQ
