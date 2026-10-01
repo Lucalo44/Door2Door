@@ -8,11 +8,10 @@
   the minifig's center and width/height its size, each normalized to [0, 1]
   as a fraction of the camera frame.
 
-  Drives two motors via a dual-PWM-per-motor driver (e.g. TB6612/DRV8833):
-  each motor gets two PWM pins, one driven for forward duty and the other
-  for reverse duty (the other held at 0) -- so speed and direction are both
-  expressed as a single signed value. Centers the minifig horizontally with
-  a PD controller, same structure as apriltag_seek_tracker.py's control loop
+  Drives two motors via a Cytron Maker Drive, which takes one PWM pin
+  (speed magnitude) plus one DIR pin (direction, HIGH/LOW) per motor. Centers
+  the minifig horizontally with a PD controller, same structure as
+  apriltag_seek_tracker.py's control loop
   elsewhere in this repo: proportional + derivative on the horizontal error,
   slew-limited output, a speed floor so it doesn't stall right at the
   deadzone edge, and a distance factor from the box's width (bigger box =
@@ -35,9 +34,11 @@
   possibly similar to the UNO R4 WiFi's Arduino_LED_Matrix).
 
   Calibrating:
-    Motor pins: placeholders below -- confirm against your actual driver
-      wiring. All four are PWM-capable pins per the UNO Q pinout (D3/D11 are
-      the two PWM pins left spare).
+    Motor pins: placeholders below -- confirm against your actual Maker
+      Drive wiring. The two PWM pins must be PWM-capable per the UNO Q
+      pinout; the two DIR pins can be any plain digital pin.
+    If a motor spins the wrong way, swap HIGH/LOW in driveMotor() below (or
+      swap that motor's two wires at the driver).
     KP/KD, DEADZONE, MIN_SPEED, MAX_SPEED_STEP: same tuning approach as
       apriltag_seek_tracker.py -- start with KP alone, add KD to damp
       oscillation, raise DEADZONE or lower MIN_SPEED if it jitters at center.
@@ -50,13 +51,13 @@
 
 #include <Arduino.h>
 
-// --- Motor driver pins (dual-PWM per motor) --------------------------------
-// placeholders -- confirm against your actual driver wiring
-const int LEFT_MOTOR_FORWARD_PIN = 5;   // ~D5
-const int LEFT_MOTOR_REVERSE_PIN = 6;   // ~D6
-const int RIGHT_MOTOR_FORWARD_PIN = 9;  // ~D9
-const int RIGHT_MOTOR_REVERSE_PIN = 10; // ~D10
-// ~D3 and ~D11 are spare PWM-capable pins, unused here.
+// --- Motor driver pins (Cytron Maker Drive -- PWM + DIR per motor) --------
+// placeholders -- confirm against your actual Maker Drive wiring
+const int LEFT_MOTOR_PWM_PIN = 5;   // ~D5
+const int LEFT_MOTOR_DIR_PIN = 4;   // D4
+const int RIGHT_MOTOR_PWM_PIN = 9;  // ~D9
+const int RIGHT_MOTOR_DIR_PIN = 7;  // D7
+// ~D3, ~D6, ~D10, ~D11 are spare PWM-capable pins, unused here.
 
 // --- Serial link to main.py (the MPU/Linux side) ---------------------------
 const long SERIAL_BAUD_RATE = 115200;        // must match MCU_BAUD_RATE in main.py
@@ -110,10 +111,10 @@ String serialBuffer = "";
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
 
-  pinMode(LEFT_MOTOR_FORWARD_PIN, OUTPUT);
-  pinMode(LEFT_MOTOR_REVERSE_PIN, OUTPUT);
-  pinMode(RIGHT_MOTOR_FORWARD_PIN, OUTPUT);
-  pinMode(RIGHT_MOTOR_REVERSE_PIN, OUTPUT);
+  pinMode(LEFT_MOTOR_PWM_PIN, OUTPUT);
+  pinMode(LEFT_MOTOR_DIR_PIN, OUTPUT);
+  pinMode(RIGHT_MOTOR_PWM_PIN, OUTPUT);
+  pinMode(RIGHT_MOTOR_DIR_PIN, OUTPUT);
 
   prevMicros = micros();
 }
@@ -156,18 +157,14 @@ void readSerial() {
   }
 }
 
-// Sets one motor's signed speed (-MAX_SPEED..+MAX_SPEED) via its
-// forward/reverse PWM pin pair -- exactly one of the two pins is ever
-// nonzero at a time.
-void driveMotor(int forwardPin, int reversePin, int speed) {
+// Sets one motor's signed speed (-MAX_SPEED..+MAX_SPEED) via its Cytron
+// Maker Drive PWM + DIR pin pair: PWM carries the magnitude, DIR selects
+// direction. If a motor spins the wrong way, swap HIGH/LOW here (or swap
+// that motor's two wires at the driver).
+void driveMotor(int pwmPin, int dirPin, int speed) {
   speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
-  if (speed >= 0) {
-    analogWrite(forwardPin, speed);
-    analogWrite(reversePin, 0);
-  } else {
-    analogWrite(forwardPin, 0);
-    analogWrite(reversePin, -speed);
-  }
+  digitalWrite(dirPin, speed >= 0 ? HIGH : LOW);
+  analogWrite(pwmPin, abs(speed));
 }
 
 // TODO: fill in once the UNO Q's actual LED matrix API is confirmed -- see
@@ -230,8 +227,8 @@ void loop() {
   lastLeftSpeed += leftStep;
   lastRightSpeed += rightStep;
 
-  driveMotor(LEFT_MOTOR_FORWARD_PIN, LEFT_MOTOR_REVERSE_PIN, lastLeftSpeed);
-  driveMotor(RIGHT_MOTOR_FORWARD_PIN, RIGHT_MOTOR_REVERSE_PIN, lastRightSpeed);
+  driveMotor(LEFT_MOTOR_PWM_PIN, LEFT_MOTOR_DIR_PIN, lastLeftSpeed);
+  driveMotor(RIGHT_MOTOR_PWM_PIN, RIGHT_MOTOR_DIR_PIN, lastRightSpeed);
 
   setMatrixPixel(ledIndexFor(linkX, linkY), haveTarget);
 }
