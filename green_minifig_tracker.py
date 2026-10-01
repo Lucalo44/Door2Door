@@ -1,26 +1,38 @@
 """Green Minifig Tracker: finds a green LEGO minifigure in the webcam feed
-and publishes its position over MQTT for the UnoQ's LED display.
+and publishes its position over MQTT for the UnoQ to act on.
 
-Detection is a two-stage pipeline:
-  1. YOLO (ultralytics, pretrained on COCO) proposes candidate object boxes
-     in the frame -- this is the neural net object detector.
-  2. COCO has no "LEGO minifigure" class, so each YOLO box is instead scored
-     by how green it is (the fraction of its pixels that fall inside an HSV
-     green range). The greenest box at or above GREEN_FRACTION_THRESHOLD is
-     reported as the minifig.
-  If no YOLO box is green enough -- a small minifig often doesn't look like
-  any COCO class at all -- this falls back to the single largest green blob
-  in the whole frame instead. It's still a real detection, just not
-  YOLO-confirmed; the preview window draws it in a different color (see
-  DETECTION_COLORS) so you can tell which path found it.
+Detection prefers a fine-tuned YOLOv8 model (see train_yolo.py and its
+docstring for the Roboflow labeling workflow this depends on):
+  - If runs/detect/green_minifig/weights/best.pt exists (produced by
+    train_yolo.py), it's loaded and used directly -- it was trained on a
+    single "Minifig" class, so the highest-confidence detection above
+    YOLO_CONFIDENCE is reported as-is, no color filtering needed.
+  - Otherwise, this falls back to the generic COCO-pretrained yolov8n.pt.
+    COCO has no "minifigure" class, so each proposed box is instead scored by
+    how green it is (the fraction of its pixels inside an HSV green range);
+    the greenest box at or above GREEN_FRACTION_THRESHOLD is reported. If no
+    box is green enough, the single largest green blob in the whole frame is
+    used instead -- still a real detection, just not YOLO-confirmed. This
+    fallback exists so the script is runnable (if not very reliable) before
+    you've trained a real model.
+The preview window draws the match in a different color per source (see
+DETECTION_COLORS) so you can tell which path found it.
 
-Position is published over MQTT scaled to the UnoQ's LED_GRID_COLS x
-LED_GRID_ROWS display, ready for the UnoQ to index straight into its LED
-matrix. This script also draws its own simulated LED grid (a blue dot at the
-scaled cell) in a preview window, so the scaling can be sanity-checked
-without the UnoQ connected -- actually driving the physical LED matrix from
-the published MQTT message is up to firmware running on the UnoQ, not this
+Position is published over MQTT as the detection box's center and size, each
+normalized to [0, 1] as a fraction of the frame -- resolution-independent, so
+the UnoQ side just multiplies by its own display's width/height to scale it.
+This script also renders its own simulated LED grid (a blue dot at the scaled
+cell) in a preview window so the scaling can be sanity-checked without the
+UnoQ connected -- actually driving the physical display, and the motors,
+from the published MQTT message is up to the UnoQ's own code, not this
 script.
+
+NOTE on LED_GRID_COLS/LED_GRID_ROWS: set to 12x8 per instructions, but the
+UNO Q's official pinout doc (full-pinout.pdf) documents its onboard LED
+matrix as 8 rows x 13 columns (104 LEDs, numbered 1-104), not 12x8. If the
+UnoQ code ends up using that onboard matrix rather than a separate 12x8
+module, update these two constants to match (they only affect this script's
+own debug preview window, not what's published over MQTT).
 
 Setup:
   pip install -r requirements.txt
@@ -30,12 +42,13 @@ Setup:
 Calibrating:
   CAMERA_INDEX: try 0 first, then 1, 2... while watching the preview window
     to find which index is actually your camera.
-  H/S/V low/high trackbars: watch the "green mask" preview window and adjust
-    so only the minifig -- not the background -- shows up white. The
-    GREEN_HSV_LOWER/GREEN_HSV_UPPER constants below are just the starting
-    values loaded into those trackbars.
-  GREEN_FRACTION_THRESHOLD/MIN_GREEN_AREA: placeholders -- tune against false
-    positives/negatives on your own minifig and lighting.
+  H/S/V low/high trackbars (generic-model fallback only): watch the "green
+    mask" preview window and adjust so only the minifig -- not the
+    background -- shows up white. GREEN_HSV_LOWER/GREEN_HSV_UPPER below are
+    just the starting values loaded into those trackbars.
+  GREEN_FRACTION_THRESHOLD/MIN_GREEN_AREA (generic-model fallback only):
+    placeholders -- tune against false positives/negatives on your own
+    minifig and lighting.
 
 Press 'q' or close the window to quit.
 """
@@ -43,6 +56,7 @@ Press 'q' or close the window to quit.
 import json
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -53,10 +67,11 @@ from ultralytics import YOLO
 MQTT_BROKER = "test.mosquitto.org"  # shared public broker used in class
 MQTT_PORT = 1883
 MQTT_TOPIC = "ME193/Door2Door"
-# Payload: {"detected": bool, "x": int, "y": int} -- x/y are already scaled to
-# [0, LED_GRID_COLS) x [0, LED_GRID_ROWS), ready for the UnoQ to index
-# directly into its LED matrix. When detected is false, x/y repeat the last
-# known position rather than jumping to (0, 0).
+# Payload: {"detected": bool, "x": float, "y": float, "width": float,
+# "height": float} -- x/y are the detection box's center, width/height are
+# its size, all normalized to [0, 1] as a fraction of the frame. When
+# detected is false, x/y/width/height repeat the last known values rather
+# than jumping to (0, 0).
 PUBLISH_INTERVAL_S = 0.1  # publish at most 10x/sec -- test.mosquitto.org is a
                            # shared public broker, don't flood it at full
                            # camera frame rate
@@ -65,22 +80,20 @@ PUBLISH_INTERVAL_S = 0.1  # publish at most 10x/sec -- test.mosquitto.org is a
 CAMERA_INDEX = 0  # try 0 first, then 1, 2... while watching the preview
                    # window to find which index is actually your camera
 
-# --- LED display --------------------------------------------------------
-LED_GRID_COLS = 12  # UnoQ LED display width, in LEDs
-LED_GRID_ROWS = 8   # UnoQ LED display height, in LEDs
+# --- LED display (this script's own debug preview only -- see NOTE above) --
+LED_GRID_COLS = 12
+LED_GRID_ROWS = 8
 LED_PREVIEW_CELL_PX = 40  # size of each simulated LED cell in the preview window
 
 # --- YOLO object detection ------------------------------------------------
-YOLO_MODEL = "yolov8n.pt"  # smallest/fastest pretrained COCO model --
+CUSTOM_MODEL_PATH = Path(__file__).parent / "runs" / "detect" / "green_minifig" / "weights" / "best.pt"
+YOLO_MODEL = "yolov8n.pt"  # generic fallback if CUSTOM_MODEL_PATH doesn't exist yet --
                            # auto-downloaded on first run
 YOLO_CONFIDENCE = 0.25     # minimum detection confidence to consider a box
 
-# --- Green color matching -------------------------------------------------
-# COCO has no "LEGO minifigure" class, so YOLO alone won't reliably find one --
-# it can only propose object-shaped boxes. These boxes (and, as a fallback,
-# the whole frame) are then checked for "greenness" via an HSV color mask to
-# actually pick out the minifig. Starting values only -- retune live with the
-# trackbars below while watching the mask preview window.
+# --- Green color matching (generic-model fallback only) ------------------
+# Starting values only -- retune live with the trackbars below while
+# watching the mask preview window.
 GREEN_HSV_LOWER = np.array([40, 70, 70])
 GREEN_HSV_UPPER = np.array([80, 255, 255])
 GREEN_FRACTION_THRESHOLD = 0.15  # a YOLO box must be at least this green
@@ -88,7 +101,11 @@ GREEN_FRACTION_THRESHOLD = 0.15  # a YOLO box must be at least this green
 MIN_GREEN_AREA = 150  # pixels -- ignores tiny green specks/noise when falling
                        # back to whole-frame contour detection
 
-DETECTION_COLORS = {"yolo": (0, 255, 0), "color-fallback": (0, 165, 255)}
+DETECTION_COLORS = {
+    "custom-yolo": (0, 255, 255),
+    "yolo": (0, 255, 0),
+    "color-fallback": (0, 165, 255),
+}
 
 
 def box_green_fraction(mask: np.ndarray, box: tuple[int, int, int, int]) -> float:
@@ -99,11 +116,18 @@ def box_green_fraction(mask: np.ndarray, box: tuple[int, int, int, int]) -> floa
     return float(np.count_nonzero(region)) / region.size
 
 
-def find_minifig(mask: np.ndarray, boxes: list[tuple[int, int, int, int]]):
-    """Returns ((x1, y1, x2, y2), source), or (None, None) if nothing green
-    enough was found. source is "yolo" if a YOLO-proposed box was green
-    enough, or "color-fallback" if the largest green blob in the whole frame
-    was used instead."""
+def best_confidence_box(boxes: list[tuple[int, int, int, int]], confidences: list[float]):
+    if not boxes:
+        return None
+    best_i = max(range(len(boxes)), key=lambda i: confidences[i])
+    return boxes[best_i]
+
+
+def find_minifig_by_color(mask: np.ndarray, boxes: list[tuple[int, int, int, int]]):
+    """Generic-model fallback: returns ((x1, y1, x2, y2), source), or
+    (None, None) if nothing green enough was found. source is "yolo" if a
+    YOLO-proposed box was green enough, or "color-fallback" if the largest
+    green blob in the whole frame was used instead."""
     best_box, best_fraction = None, 0.0
     for box in boxes:
         fraction = box_green_fraction(mask, box)
@@ -122,12 +146,15 @@ def find_minifig(mask: np.ndarray, boxes: list[tuple[int, int, int, int]]):
     return (x, y, x + w, y + h), "color-fallback"
 
 
-def scale_to_led_grid(cx: int, cy: int, frame_width: int, frame_height: int) -> tuple[int, int]:
-    col = int(cx / frame_width * LED_GRID_COLS)
-    row = int(cy / frame_height * LED_GRID_ROWS)
-    col = max(0, min(LED_GRID_COLS - 1, col))
-    row = max(0, min(LED_GRID_ROWS - 1, row))
-    return col, row
+def normalize_box(box: tuple[int, int, int, int], frame_width: int, frame_height: int):
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    return (
+        cx / frame_width,
+        cy / frame_height,
+        (x2 - x1) / frame_width,
+        (y2 - y1) / frame_height,
+    )
 
 
 def render_led_preview(col: int, row: int, detected: bool) -> np.ndarray:
@@ -148,7 +175,18 @@ def render_led_preview(col: int, row: int, detected: bool) -> np.ndarray:
 
 
 def main():
-    model = YOLO(YOLO_MODEL)
+    if CUSTOM_MODEL_PATH.exists():
+        model = YOLO(str(CUSTOM_MODEL_PATH))
+        using_custom_model = True
+        print(f"Loaded fine-tuned minifig detector from {CUSTOM_MODEL_PATH}")
+    else:
+        model = YOLO(YOLO_MODEL)
+        using_custom_model = False
+        print(
+            f"No fine-tuned model found at {CUSTOM_MODEL_PATH} -- using generic "
+            f"{YOLO_MODEL} with color-based filtering instead. Run train_yolo.py "
+            "after labeling your dataset in Roboflow for real detection."
+        )
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -161,16 +199,17 @@ def main():
 
     window = "Green Minifig Tracker (q to quit)"
     cv2.namedWindow(window)
-    cv2.createTrackbar("H low", window, int(GREEN_HSV_LOWER[0]), 179, lambda _: None)
-    cv2.createTrackbar("H high", window, int(GREEN_HSV_UPPER[0]), 179, lambda _: None)
-    cv2.createTrackbar("S low", window, int(GREEN_HSV_LOWER[1]), 255, lambda _: None)
-    cv2.createTrackbar("S high", window, int(GREEN_HSV_UPPER[1]), 255, lambda _: None)
-    cv2.createTrackbar("V low", window, int(GREEN_HSV_LOWER[2]), 255, lambda _: None)
-    cv2.createTrackbar("V high", window, int(GREEN_HSV_UPPER[2]), 255, lambda _: None)
+    if not using_custom_model:
+        cv2.createTrackbar("H low", window, int(GREEN_HSV_LOWER[0]), 179, lambda _: None)
+        cv2.createTrackbar("H high", window, int(GREEN_HSV_UPPER[0]), 179, lambda _: None)
+        cv2.createTrackbar("S low", window, int(GREEN_HSV_LOWER[1]), 255, lambda _: None)
+        cv2.createTrackbar("S high", window, int(GREEN_HSV_UPPER[1]), 255, lambda _: None)
+        cv2.createTrackbar("V low", window, int(GREEN_HSV_LOWER[2]), 255, lambda _: None)
+        cv2.createTrackbar("V high", window, int(GREEN_HSV_UPPER[2]), 255, lambda _: None)
 
     # Start centered rather than at (0, 0), so a never-yet-detected minifig
     # doesn't make the UnoQ light up a corner LED by default.
-    last_col, last_row = LED_GRID_COLS // 2, LED_GRID_ROWS // 2
+    last_x, last_y, last_w, last_h = 0.5, 0.5, 0.0, 0.0
     last_publish_time = 0.0
 
     print("Press 'q' or close the window to quit.")
@@ -184,38 +223,43 @@ def main():
                 print("Camera read failed -- stopping.")
                 break
 
-            lower = np.array([
-                cv2.getTrackbarPos("H low", window),
-                cv2.getTrackbarPos("S low", window),
-                cv2.getTrackbarPos("V low", window),
-            ])
-            upper = np.array([
-                cv2.getTrackbarPos("H high", window),
-                cv2.getTrackbarPos("S high", window),
-                cv2.getTrackbarPos("V high", window),
-            ])
-
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            mask = cv2.inRange(hsv, lower, upper)
-
             results = model.predict(frame, conf=YOLO_CONFIDENCE, verbose=False)[0]
             boxes = [tuple(map(int, b)) for b in results.boxes.xyxy.tolist()]
             for box in boxes:
                 cv2.rectangle(frame, box[:2], box[2:], (128, 128, 128), 1)
 
-            box, source = find_minifig(mask, boxes)
+            if using_custom_model:
+                confidences = results.boxes.conf.tolist()
+                box = best_confidence_box(boxes, confidences)
+                source = "custom-yolo" if box is not None else None
+            else:
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                lower = np.array([
+                    cv2.getTrackbarPos("H low", window),
+                    cv2.getTrackbarPos("S low", window),
+                    cv2.getTrackbarPos("V low", window),
+                ])
+                upper = np.array([
+                    cv2.getTrackbarPos("H high", window),
+                    cv2.getTrackbarPos("S high", window),
+                    cv2.getTrackbarPos("V high", window),
+                ])
+                mask = cv2.inRange(hsv, lower, upper)
+                box, source = find_minifig_by_color(mask, boxes)
+                cv2.imshow("green mask", mask)
+
             detected = box is not None
             if detected:
-                x1, y1, x2, y2 = box
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 frame_height, frame_width = frame.shape[:2]
-                last_col, last_row = scale_to_led_grid(cx, cy, frame_width, frame_height)
+                last_x, last_y, last_w, last_h = normalize_box(box, frame_width, frame_height)
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), DETECTION_COLORS[source], 2)
-                cv2.circle(frame, (cx, cy), 6, (255, 0, 0), -1)  # blue dot on the minifig
+                x1, y1, x2, y2 = box
+                color = DETECTION_COLORS[source]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 6, (255, 0, 0), -1)  # blue dot on the minifig
                 cv2.putText(
-                    frame, f"{source} -> grid ({last_col}, {last_row})", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, DETECTION_COLORS[source], 2,
+                    frame, f"{source} -> ({last_x:.2f}, {last_y:.2f})", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
                 )
             else:
                 cv2.putText(
@@ -226,12 +270,19 @@ def main():
             now = time.monotonic()
             if now - last_publish_time >= PUBLISH_INTERVAL_S:
                 last_publish_time = now
-                payload = json.dumps({"detected": detected, "x": last_col, "y": last_row})
+                payload = json.dumps({
+                    "detected": detected,
+                    "x": round(last_x, 4),
+                    "y": round(last_y, 4),
+                    "width": round(last_w, 4),
+                    "height": round(last_h, 4),
+                })
                 client.publish(MQTT_TOPIC, payload)
 
+            preview_col = max(0, min(LED_GRID_COLS - 1, int(last_x * LED_GRID_COLS)))
+            preview_row = max(0, min(LED_GRID_ROWS - 1, int(last_y * LED_GRID_ROWS)))
             cv2.imshow(window, frame)
-            cv2.imshow("green mask", mask)
-            cv2.imshow("UnoQ LED preview", render_led_preview(last_col, last_row, detected))
+            cv2.imshow("UnoQ LED preview", render_led_preview(preview_col, preview_row, detected))
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
