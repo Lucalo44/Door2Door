@@ -1,0 +1,5 @@
+name: MQTT Minifig Drive
+description: "Tracks a minifig's position from MQTT, shows it on the LED matrix, and drives two Cytron Maker Drive motors to keep it centered"
+ports: []
+bricks: []
+icon: 🚗

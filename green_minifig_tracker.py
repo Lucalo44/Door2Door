@@ -18,21 +18,22 @@ docstring for the Roboflow labeling workflow this depends on):
 The preview window draws the match in a different color per source (see
 DETECTION_COLORS) so you can tell which path found it.
 
-Position is published over MQTT as the detection box's center and size, each
-normalized to [0, 1] as a fraction of the frame -- resolution-independent, so
-the UnoQ side just multiplies by its own display's width/height to scale it.
-This script also renders its own simulated LED grid (a blue dot at the scaled
-cell) in a preview window so the scaling can be sanity-checked without the
-UnoQ connected -- actually driving the physical display, and the motors,
-from the published MQTT message is up to the UnoQ's own code, not this
-script.
+MQTT topic and payload match ArduinoApps/mqtt-minifig-monitor (ported from
+https://github.com/mohdalmheiri/ME193-Robotics) rather than this project's
+own earlier format: {"x": <pixel x>, "y": <pixel y>, "w": <frame width>,
+"h": <frame height>} -- x/y are the detection box's center in pixel
+coordinates, and w/h are the camera frame's own pixel dimensions (used by
+the receiver only to normalize x/y into its LED grid), not the detection
+box's size. A message is only published when something is actually
+detected -- the UnoQ side ages out a missing minifig on its own via how long
+ago the last message arrived, rather than this script sending an explicit
+"not detected" message.
 
-NOTE on LED_GRID_COLS/LED_GRID_ROWS: set to 12x8 per instructions, but the
-UNO Q's official pinout doc (full-pinout.pdf) documents its onboard LED
-matrix as 8 rows x 13 columns (104 LEDs, numbered 1-104), not 12x8. If the
-UnoQ code ends up using that onboard matrix rather than a separate 12x8
-module, update these two constants to match (they only affect this script's
-own debug preview window, not what's published over MQTT).
+This script also renders its own simulated LED grid (a blue dot at the
+scaled cell) in a preview window so the scaling can be sanity-checked
+without the UnoQ connected -- actually driving the physical display, and the
+motors, from the published MQTT message is up to the UnoQ's own code (see
+ArduinoApps/mqtt-minifig-drive), not this script.
 
 Setup:
   pip install -r requirements.txt
@@ -66,12 +67,7 @@ from ultralytics import YOLO
 # --- MQTT -------------------------------------------------------------------
 MQTT_BROKER = "test.mosquitto.org"  # shared public broker used in class
 MQTT_PORT = 1883
-MQTT_TOPIC = "ME193/Door2Door"
-# Payload: {"detected": bool, "x": float, "y": float, "width": float,
-# "height": float} -- x/y are the detection box's center, width/height are
-# its size, all normalized to [0, 1] as a fraction of the frame. When
-# detected is false, x/y/width/height repeat the last known values rather
-# than jumping to (0, 0).
+MQTT_TOPIC = "ME193/minifig"  # must match MQTT_TOPIC in ArduinoApps/mqtt-minifig-drive/python/main.py
 PUBLISH_INTERVAL_S = 0.1  # publish at most 10x/sec -- test.mosquitto.org is a
                            # shared public broker, don't flood it at full
                            # camera frame rate
@@ -80,8 +76,10 @@ PUBLISH_INTERVAL_S = 0.1  # publish at most 10x/sec -- test.mosquitto.org is a
 CAMERA_INDEX = 0  # try 0 first, then 1, 2... while watching the preview
                    # window to find which index is actually your camera
 
-# --- LED display (this script's own debug preview only -- see NOTE above) --
-LED_GRID_COLS = 12
+# --- LED display (this script's own debug preview only) ------------------
+# Matches the UnoQ's onboard matrix: 8 rows x 13 columns, confirmed both by
+# its pinout doc and by ArduinoApps/mqtt-minifig-monitor's FRAME_ROWS/COLS.
+LED_GRID_COLS = 13
 LED_GRID_ROWS = 8
 LED_PREVIEW_CELL_PX = 40  # size of each simulated LED cell in the preview window
 
@@ -146,18 +144,12 @@ def find_minifig_by_color(mask: np.ndarray, boxes: list[tuple[int, int, int, int
     return (x, y, x + w, y + h), "color-fallback"
 
 
-def normalize_box(box: tuple[int, int, int, int], frame_width: int, frame_height: int):
+def box_center(box: tuple[int, int, int, int]) -> tuple[int, int]:
     x1, y1, x2, y2 = box
-    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-    return (
-        cx / frame_width,
-        cy / frame_height,
-        (x2 - x1) / frame_width,
-        (y2 - y1) / frame_height,
-    )
+    return (x1 + x2) // 2, (y1 + y2) // 2
 
 
-def render_led_preview(col: int, row: int, detected: bool) -> np.ndarray:
+def render_led_preview(col: int, row: int) -> np.ndarray:
     img = np.zeros((LED_GRID_ROWS * LED_PREVIEW_CELL_PX, LED_GRID_COLS * LED_PREVIEW_CELL_PX, 3), dtype=np.uint8)
     for gx in range(LED_GRID_COLS + 1):
         x = gx * LED_PREVIEW_CELL_PX
@@ -166,11 +158,7 @@ def render_led_preview(col: int, row: int, detected: bool) -> np.ndarray:
         y = gy * LED_PREVIEW_CELL_PX
         cv2.line(img, (0, y), (img.shape[1], y), (40, 40, 40), 1)
     center = (col * LED_PREVIEW_CELL_PX + LED_PREVIEW_CELL_PX // 2, row * LED_PREVIEW_CELL_PX + LED_PREVIEW_CELL_PX // 2)
-    # Full blue when currently detected, dim blue when showing a stale
-    # last-known position -- same distinction as the "detected" flag published
-    # over MQTT.
-    dot_color = (255, 0, 0) if detected else (90, 60, 0)
-    cv2.circle(img, center, LED_PREVIEW_CELL_PX // 3, dot_color, -1)
+    cv2.circle(img, center, LED_PREVIEW_CELL_PX // 3, (255, 0, 0), -1)
     return img
 
 
@@ -207,10 +195,11 @@ def main():
         cv2.createTrackbar("V low", window, int(GREEN_HSV_LOWER[2]), 255, lambda _: None)
         cv2.createTrackbar("V high", window, int(GREEN_HSV_UPPER[2]), 255, lambda _: None)
 
-    # Start centered rather than at (0, 0), so a never-yet-detected minifig
-    # doesn't make the UnoQ light up a corner LED by default.
-    last_x, last_y, last_w, last_h = 0.5, 0.5, 0.0, 0.0
     last_publish_time = 0.0
+    # Last detection's pixel center, for the preview window only -- starts
+    # centered rather than at (0, 0) so the preview doesn't show a corner dot
+    # before anything's ever been detected.
+    preview_col, preview_row = LED_GRID_COLS // 2, LED_GRID_ROWS // 2
 
     print("Press 'q' or close the window to quit.")
     try:
@@ -251,38 +240,37 @@ def main():
             detected = box is not None
             if detected:
                 frame_height, frame_width = frame.shape[:2]
-                last_x, last_y, last_w, last_h = normalize_box(box, frame_width, frame_height)
+                cx, cy = box_center(box)
 
                 x1, y1, x2, y2 = box
                 color = DETECTION_COLORS[source]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 6, (255, 0, 0), -1)  # blue dot on the minifig
+                cv2.circle(frame, (cx, cy), 6, (255, 0, 0), -1)  # blue dot on the minifig
                 cv2.putText(
-                    frame, f"{source} -> ({last_x:.2f}, {last_y:.2f})", (10, 30),
+                    frame, f"{source} -> ({cx}, {cy})", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
                 )
+
+                now = time.monotonic()
+                if now - last_publish_time >= PUBLISH_INTERVAL_S:
+                    last_publish_time = now
+                    payload = json.dumps({"x": cx, "y": cy, "w": frame_width, "h": frame_height})
+                    client.publish(MQTT_TOPIC, payload)
+
+                preview_col = max(0, min(LED_GRID_COLS - 1, int(cx / frame_width * LED_GRID_COLS)))
+                preview_row = max(0, min(LED_GRID_ROWS - 1, int(cy / frame_height * LED_GRID_ROWS)))
             else:
                 cv2.putText(
                     frame, "no green minifig found", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
                 )
+                # Deliberately not publishing anything -- the UnoQ side ages
+                # out a missing minifig on its own based on how long ago its
+                # last message arrived, rather than us sending an explicit
+                # "not detected" message. See mqtt-minifig-drive/python/main.py.
 
-            now = time.monotonic()
-            if now - last_publish_time >= PUBLISH_INTERVAL_S:
-                last_publish_time = now
-                payload = json.dumps({
-                    "detected": detected,
-                    "x": round(last_x, 4),
-                    "y": round(last_y, 4),
-                    "width": round(last_w, 4),
-                    "height": round(last_h, 4),
-                })
-                client.publish(MQTT_TOPIC, payload)
-
-            preview_col = max(0, min(LED_GRID_COLS - 1, int(last_x * LED_GRID_COLS)))
-            preview_row = max(0, min(LED_GRID_ROWS - 1, int(last_y * LED_GRID_ROWS)))
             cv2.imshow(window, frame)
-            cv2.imshow("UnoQ LED preview", render_led_preview(preview_col, preview_row, detected))
+            cv2.imshow("UnoQ LED preview", render_led_preview(preview_col, preview_row))
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break

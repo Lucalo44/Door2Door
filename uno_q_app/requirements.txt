@@ -1,2 +1,0 @@
-paho-mqtt>=2.0   # main.py -- subscribes to the minifig position published by green_minifig_tracker.py
-pyserial>=3.5     # main.py -- forwards each detection to sketch.ino over serial
