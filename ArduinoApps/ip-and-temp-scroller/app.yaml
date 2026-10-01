@@ -1,0 +1,5 @@
+name: IP and Temp Scroller
+description: Scrolls the board's IP address and current outdoor temperature (Open-Meteo) across the LED matrix
+ports: []
+bricks: []
+icon: 🌡️
