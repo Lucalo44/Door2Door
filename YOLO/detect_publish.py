@@ -2,8 +2,8 @@
 detect_publish.py - watch the laptop camera with our trained YOLO model and
 publish where each minifig is over MQTT.
 
-  green minifig -> topic ME193/Mohammed/green
-  blue minifig  -> topic ME193/Mohammed/blue
+  green minifig -> topic ME193/Luca/green
+  blue minifig  -> topic ME193/Luca/blue
 
 Message (JSON), same format as the professor's MQTT Minifig Monitor:
   {"x": 412.0, "y": 230.5, "w": 640, "h": 480, "conf": 0.91}
@@ -23,8 +23,8 @@ import cv2
 import paho.mqtt.client as mqtt
 from ultralytics import YOLO
 
-# Run from this folder and load the model by its short name. A full path with
-# the apostrophe in "Mohammed's Projects" breaks Ultralytics' file loading.
+# Run from this folder and load the model by its short name -- also makes
+# "python detect_publish.py" work regardless of your current directory.
 os.chdir(Path(__file__).parent)
 
 # ---------------- settings ----------------
@@ -36,8 +36,8 @@ SEND_RATE = 10          # MQTT messages per second, max
 BROKER = "broker.hivemq.com"
 PORT = 1883
 TOPICS = {
-    "green_minifig": "ME193/Mohammed/green",
-    "blue_minifig": "ME193/Mohammed/blue",
+    "green_minifig": "ME193/Luca/green",
+    "blue_minifig": "ME193/Luca/blue",
 }
 BOX_COLORS = {"green_minifig": (0, 200, 0), "blue_minifig": (255, 120, 0)}  # BGR
 # ------------------------------------------

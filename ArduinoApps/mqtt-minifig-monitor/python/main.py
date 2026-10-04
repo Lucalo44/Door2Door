@@ -8,16 +8,19 @@ import paho.mqtt.client as mqtt
 from arduino.app_utils import App, Bridge, Frame
 
 # --- MQTT feed -------------------------------------------------------------
-MQTT_BROKER = "test.mosquitto.org"
+# Must match the broker/topic detect_publish.py (in Door2Door/YOLO/) actually
+# publishes to -- that script and this one were ported from two different
+# people's code and didn't originally agree on either.
+MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
-MQTT_TOPIC = "ME193/minifig"
+MQTT_TOPIC = "ME193/Luca/green"
 
 # --- Heartbeat ---------------------------------------------------------------
 # Published so anyone watching the broker (e.g. an instructor dashboard) can
 # tell this board is alive, independent of whether a target is being tracked.
 MQTT_HEARTBEAT_TOPIC = "ME193/heartbeat"
 HEARTBEAT_INTERVAL = 60  # seconds
-DEVICE_ID = "Mohammed"  # App Lab's name for this board - update if renamed
+DEVICE_ID = "Luca"  # App Lab's name for this board - update if renamed
 
 # --- Display ----------------------------------------------------------------
 FRAME_ROWS = 8

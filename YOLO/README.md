@@ -34,10 +34,10 @@ ignores.
 `detect_publish.py` runs `best.pt` on the laptop camera and publishes where
 each minifig is to the `broker.hivemq.com` broker (port 1883):
 
-| Minifig | Topic                  |
-| ------- | ---------------------- |
-| green   | `ME193/Mohammed/green` |
-| blue    | `ME193/Mohammed/blue`  |
+| Minifig | Topic              |
+| ------- | ------------------ |
+| green   | `ME193/Luca/green` |
+| blue    | `ME193/Luca/blue`  |
 
 Each message is JSON, in the same format as the professor's MQTT Minifig
 Monitor:
@@ -60,8 +60,9 @@ You must run it from inside this `YOLO` folder:
 python detect_publish.py
 ```
 
-Ultralytics can't load a model from a full path containing the apostrophe
-in `Mohammed's Projects`, so the script loads `best.pt` by its short name.
+The script `os.chdir()`s to this folder and loads the model by its short
+name, so `python detect_publish.py` works regardless of your current
+directory.
 
 If it opens the wrong camera (for example your iPhone), change `CAMERA`
 at the top of the script to `1`.
