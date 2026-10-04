@@ -1,0 +1,5 @@
+runs/
+yolov8n.pt
+
+# Label caches Ultralytics writes next to the dataset during training
+dataset/**/*.cache

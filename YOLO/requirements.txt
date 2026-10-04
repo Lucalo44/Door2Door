@@ -1,0 +1,2 @@
+ultralytics
+paho-mqtt>=2.0
