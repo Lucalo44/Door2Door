@@ -223,9 +223,12 @@ def control_step(cx, box_width, frame_width):
     if abs(error) > deadzone_pixels:
         raw = (kp * error + kd * _smoothed_d_error) * distance_factor
         # Faster the farther off-center it is, slower as it nears the line --
-        # but floored at min_speed so it doesn't stall out before actually
-        # getting there.
-        magnitude = max(min_speed, min(max_speed, abs(raw)))
+        # floored at min_speed so it doesn't stall out before actually
+        # getting there, but max_speed is applied last/outermost so it is
+        # always the true ceiling even if min_speed is set higher than it
+        # (otherwise min_speed would silently win and max_speed would do
+        # nothing, which is exactly what was happening here before).
+        magnitude = min(max_speed, max(min_speed, abs(raw)))
         desired_speed = DIRECTION_SIGN * (magnitude if raw >= 0 else -magnitude)
 
     # Slew-limit so the actual command glides toward desired_speed instead of
