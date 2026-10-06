@@ -79,6 +79,11 @@ WINDOW_NAME = "Door-to-door: YOLO minifig detector (q to quit)"
 # (matches sketch.ino's analogWrite range), not meant to be tuned, so it's
 # not a slider.
 MAX_SPEED = 255
+RIGHT_MOTOR_SIGN = 1  # placeholder -- set to -1 if the car drives straight
+                      # instead of turning in place (mirror-mounted motors;
+                      # see control_step()'s comment). Not a slider since
+                      # it's a one-time hardware fact, not something to
+                      # retune live.
 KP_INIT, KP_MAX = 1.2, 5.0        # PWM per pixel of horizontal error
 KD_INIT, KD_MAX = 0.15, 2.0       # PWM per (pixel/second) of error's rate of change
 MIN_SPEED_INIT = 60    # smallest PWM that reliably overcomes the motors' own
@@ -186,9 +191,14 @@ def control_step(cx, w):
         magnitude = max(min_speed, min(MAX_SPEED, abs(raw)))
         desired = magnitude if raw >= 0 else -magnitude
 
-    # Turn toward the target (rotate in place): left/right motors get
-    # opposite signs. Swap these if it turns the wrong way.
-    return _slew(-desired, desired, max_speed_step)
+    # Intended to turn in place: left/right motors get opposite signs. This
+    # assumes the two motors are NOT mirror-mounted -- if they are (as
+    # whistle_soccer.py/apriltag_seek_tracker.py document for this same kind
+    # of chassis elsewhere in this repo), opposite signs actually drive
+    # straight instead of rotating, and same signs rotate instead. If the
+    # car drives off in a straight line instead of turning, set
+    # RIGHT_MOTOR_SIGN to -1 below to test that.
+    return _slew(-desired, RIGHT_MOTOR_SIGN * desired, max_speed_step)
 
 
 def reset_control():
