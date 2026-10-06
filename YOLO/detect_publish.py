@@ -29,7 +29,7 @@ ArduinoApps/mqtt-minifig-drive/python/main.py's CONTROL_TIMEOUT).
 
 Why the control math lives here instead of on the UnoQ: this way, tuning
 the gains below is just editing this file and rerunning it -- no App Lab
-redeploy needed. The Kp/Kd/Min Speed/Deadzone/Max Step/Smoothing trackbars
+redeploy needed. The Kp/Kd/Max Speed/Deadzone/Max Step/Smoothing trackbars
 on the preview window let you retune live, without even restarting the
 script.
 
@@ -112,10 +112,6 @@ RIGHT_MOTOR_SIGN = 1  # placeholder, unconfirmed for this chassis -- the two
                        # driving straight, flip this to +1.
 KP_INIT, KP_MAX = 1.2, 5.0        # speed per pixel of horizontal error
 KD_INIT, KD_MAX = 0.15, 2.0       # speed per (pixel/second) of error's rate of change
-MIN_SPEED_INIT = 60    # smallest PWM that reliably overcomes the motors' own
-                        # static friction -- below this they just stall
-                        # instead of creeping closer. Raise if it still
-                        # stalls short of center; lower if it overshoots.
 DEADZONE_PIXELS_INIT = 20  # horizontal error smaller than this (in pixels)
                             # counts as "centered" -> stop
 MAX_SPEED_STEP_INIT = 15   # max change in commanded PWM per control step --
@@ -196,7 +192,6 @@ def control_step(cx, box_width, frame_width):
 
     kp = cv2.getTrackbarPos("Kp x100", WINDOW_NAME) / 100.0
     kd = cv2.getTrackbarPos("Kd x100", WINDOW_NAME) / 100.0
-    min_speed = cv2.getTrackbarPos("Min Speed", WINDOW_NAME)
     max_speed = cv2.getTrackbarPos("Max Speed", WINDOW_NAME)
     deadzone_pixels = cv2.getTrackbarPos("Deadzone px", WINDOW_NAME)
     max_speed_step = max(1, cv2.getTrackbarPos("Max Step", WINDOW_NAME))
@@ -223,12 +218,11 @@ def control_step(cx, box_width, frame_width):
     if abs(error) > deadzone_pixels:
         raw = (kp * error + kd * _smoothed_d_error) * distance_factor
         # Faster the farther off-center it is, slower as it nears the line --
-        # floored at min_speed so it doesn't stall out before actually
-        # getting there, but max_speed is applied last/outermost so it is
-        # always the true ceiling even if min_speed is set higher than it
-        # (otherwise min_speed would silently win and max_speed would do
-        # nothing, which is exactly what was happening here before).
-        magnitude = min(max_speed, max(min_speed, abs(raw)))
+        # capped at max_speed. No floor: Kp*error shrinks toward zero right
+        # near the deadzone edge, so the car may stall just short of fully
+        # centering if static friction needs more than that to overcome --
+        # if so, that is what a floor (removed here) would fix.
+        magnitude = min(max_speed, abs(raw))
         desired_speed = DIRECTION_SIGN * (magnitude if raw >= 0 else -magnitude)
 
     # Slew-limit so the actual command glides toward desired_speed instead of
@@ -264,7 +258,6 @@ def main():
     cv2.namedWindow(WINDOW_NAME)
     cv2.createTrackbar("Kp x100", WINDOW_NAME, int(KP_INIT * 100), int(KP_MAX * 100), lambda _: None)
     cv2.createTrackbar("Kd x100", WINDOW_NAME, int(KD_INIT * 100), int(KD_MAX * 100), lambda _: None)
-    cv2.createTrackbar("Min Speed", WINDOW_NAME, MIN_SPEED_INIT, MAX_SPEED_CEILING, lambda _: None)
     cv2.createTrackbar("Max Speed", WINDOW_NAME, MAX_SPEED_INIT, MAX_SPEED_CEILING, lambda _: None)
     cv2.createTrackbar("Deadzone px", WINDOW_NAME, DEADZONE_PIXELS_INIT, 100, lambda _: None)
     cv2.createTrackbar("Max Step", WINDOW_NAME, MAX_SPEED_STEP_INIT, 50, lambda _: None)
