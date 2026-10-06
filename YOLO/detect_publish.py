@@ -1,6 +1,17 @@
 """
 detect_publish.py - watch the laptop camera with our trained YOLO model,
-compute motor speeds to center the minifig, and publish both over MQTT.
+compute a motor speed to park the car at the camera's center, and publish
+both over MQTT.
+
+The camera is stationary (not mounted on the car): it watches the car --
+which carries the green minifig as its own marker -- drive back and forth
+along a straight track. This closes the loop the same way
+aprilTags/apriltag_pd_tracker.py does elsewhere in this repo: the marker's
+horizontal pixel position is the measurement, the frame's horizontal center
+is the fixed setpoint, and PD control turns "how far off-center" into a
+single forward/backward speed applied to both motors (sign-corrected for
+mirror-mounting via RIGHT_MOTOR_SIGN) -- there is no left/right steering at
+all, same as that script.
 
 Single-class model (just "Minifig") -- publishes to one topic:
   ME193/Luca/green
@@ -9,7 +20,9 @@ Message (JSON):
   {"x": 412.0, "y": 230.5, "w": 640, "h": 480, "conf": 0.91,
    "left": -80, "right": 80}
   x, y = center of the minifig's box in pixels; w, h = camera frame size;
-  left, right = already-PD-controlled signed motor speeds (-255..255).
+  left, right = the same PD-controlled forward/backward speed
+  (-255..255), applied to both motors (right sign-corrected for
+  mirror-mounting -- see RIGHT_MOTOR_SIGN).
 Nothing is sent for a frame with no detection - the UnoQ stops the motors
 on its own if messages stop arriving for too long (see
 ArduinoApps/mqtt-minifig-drive/python/main.py's CONTROL_TIMEOUT).
@@ -79,13 +92,18 @@ WINDOW_NAME = "Door-to-door: YOLO minifig detector (q to quit)"
 # (matches sketch.ino's analogWrite range), not meant to be tuned, so it's
 # not a slider.
 MAX_SPEED = 255
-RIGHT_MOTOR_SIGN = 1  # placeholder -- set to -1 if the car drives straight
-                      # instead of turning in place (mirror-mounted motors;
-                      # see control_step()'s comment). Not a slider since
-                      # it's a one-time hardware fact, not something to
-                      # retune live.
-KP_INIT, KP_MAX = 1.2, 5.0        # PWM per pixel of horizontal error
-KD_INIT, KD_MAX = 0.15, 2.0       # PWM per (pixel/second) of error's rate of change
+DIRECTION_SIGN = 1     # flip to -1 if the car drives away from center
+                       # instead of toward it
+RIGHT_MOTOR_SIGN = -1  # placeholder, unconfirmed for this chassis -- the two
+                       # motors are likely mirror-mounted (same as
+                       # whistle_soccer.py/apriltag_pd_tracker.py elsewhere
+                       # in this repo), so sending the same speed to both
+                       # would spin the car in place instead of driving it
+                       # straight; this inverts the right side to cancel
+                       # that out. If the car spins in place instead of
+                       # driving straight, flip this to +1.
+KP_INIT, KP_MAX = 1.2, 5.0        # speed per pixel of horizontal error
+KD_INIT, KD_MAX = 0.15, 2.0       # speed per (pixel/second) of error's rate of change
 MIN_SPEED_INIT = 60    # smallest PWM that reliably overcomes the motors' own
                         # static friction -- below this they just stall
                         # instead of creeping closer. Raise if it still
@@ -101,9 +119,21 @@ SMOOTHING_INIT = 30  # out of 100 -- weight on each new raw x reading when
                       # higher = less smoothing (more responsive, more
                       # jitter passed through to the controller). 100 = off.
 D_SMOOTHING = 0.15  # low-pass filter weight on the derivative term, same
-                     # reasoning as apriltag_seek_tracker.py's D_SMOOTHING
+                     # reasoning as apriltag_pd_tracker.py's D_SMOOTHING
                      # elsewhere in this repo -- not exposed as a slider,
                      # rarely needs retuning
+
+# The minifig's real size is fixed, so its apparent box width in pixels is a
+# proxy for the car's distance from the camera -- bigger on screen means
+# closer. This scales the PD output by (reference width / apparent width),
+# so a car that looks small (far away) drives faster and one that looks big
+# (close) drives slower, on top of the existing centering behavior. Same
+# idea as apriltag_pd_tracker.py's TAG_SIZE_REF_PIXELS.
+MINIFIG_WIDTH_REF_PIXELS = 120  # apparent box width, in pixels, considered
+                                 # "neutral" distance (factor = 1x) -- measure
+                                 # this at your track's typical distance
+DISTANCE_FACTOR_MIN = 0.5       # clamp so an extreme distance can't overwhelm Kp/Kd
+DISTANCE_FACTOR_MAX = 2.0
 # ------------------------------------------
 
 
@@ -140,30 +170,21 @@ def update_smoothed_cx(cx):
 _prev_error = 0.0
 _have_prev_error = False
 _smoothed_d_error = 0.0
-_last_left_speed = 0
-_last_right_speed = 0
+_last_speed = 0.0
 _prev_control_time = time.monotonic()
+_last_distance_factor = 1.0  # just for the on-screen readout
 
 
-def _slew(desired_left, desired_right, max_step):
-    global _last_left_speed, _last_right_speed
-    left_step = max(-max_step, min(max_step, desired_left - _last_left_speed))
-    right_step = max(-max_step, min(max_step, desired_right - _last_right_speed))
-    # Cast back to int on every update (not just the return value) -- += with
-    # a float step would otherwise silently turn these globals into floats,
-    # which broke the ":+d" formatting wherever they're read directly instead
-    # of through this function's return value.
-    _last_left_speed = int(_last_left_speed + left_step)
-    _last_right_speed = int(_last_right_speed + right_step)
-    return _last_left_speed, _last_right_speed
-
-
-def control_step(cx, w):
-    """Returns (left_speed, right_speed): a PD controller centering cx
-    within a frame of width w, same structure as apriltag_seek_tracker.py's
-    control loop elsewhere in this repo. Gains are read live from the
-    trackbars on the preview window."""
+def control_step(cx, box_width, frame_width):
+    """Returns (left_speed, right_speed) ints: a single PD-controlled
+    forward/backward speed applied to both motors (sign-corrected for
+    mirror-mounting via RIGHT_MOTOR_SIGN) to park the car -- which carries
+    the minifig as its own marker -- centered in this stationary camera's
+    view. Same structure as apriltag_pd_tracker.py's control loop elsewhere
+    in this repo, just with a YOLO-detected box instead of an AprilTag.
+    Gains are read live from the trackbars on the preview window."""
     global _prev_error, _have_prev_error, _smoothed_d_error, _prev_control_time
+    global _last_speed, _last_distance_factor
 
     kp = cv2.getTrackbarPos("Kp x100", WINDOW_NAME) / 100.0
     kd = cv2.getTrackbarPos("Kd x100", WINDOW_NAME) / 100.0
@@ -175,8 +196,8 @@ def control_step(cx, w):
     dt = now - _prev_control_time
     _prev_control_time = now
 
-    frame_center_x = w / 2
-    error = frame_center_x - cx  # positive -> target is left of center
+    frame_center_x = frame_width / 2
+    error = frame_center_x - cx  # positive -> car needs to drive toward +x
 
     raw_d_error = 0.0
     if _have_prev_error and dt > 0:
@@ -185,20 +206,27 @@ def control_step(cx, w):
     _prev_error = error
     _have_prev_error = True
 
-    desired = 0.0
-    if abs(error) > deadzone_pixels:
-        raw = kp * error + kd * _smoothed_d_error
-        magnitude = max(min_speed, min(MAX_SPEED, abs(raw)))
-        desired = magnitude if raw >= 0 else -magnitude
+    distance_factor = MINIFIG_WIDTH_REF_PIXELS / max(1, box_width)
+    distance_factor = max(DISTANCE_FACTOR_MIN, min(DISTANCE_FACTOR_MAX, distance_factor))
+    _last_distance_factor = distance_factor
 
-    # Intended to turn in place: left/right motors get opposite signs. This
-    # assumes the two motors are NOT mirror-mounted -- if they are (as
-    # whistle_soccer.py/apriltag_seek_tracker.py document for this same kind
-    # of chassis elsewhere in this repo), opposite signs actually drive
-    # straight instead of rotating, and same signs rotate instead. If the
-    # car drives off in a straight line instead of turning, set
-    # RIGHT_MOTOR_SIGN to -1 below to test that.
-    return _slew(-desired, RIGHT_MOTOR_SIGN * desired, max_speed_step)
+    desired_speed = 0.0
+    if abs(error) > deadzone_pixels:
+        raw = (kp * error + kd * _smoothed_d_error) * distance_factor
+        # Faster the farther off-center it is, slower as it nears the line --
+        # but floored at min_speed so it doesn't stall out before actually
+        # getting there.
+        magnitude = max(min_speed, min(MAX_SPEED, abs(raw)))
+        desired_speed = DIRECTION_SIGN * (magnitude if raw >= 0 else -magnitude)
+
+    # Slew-limit so the actual command glides toward desired_speed instead of
+    # jumping straight there.
+    step = max(-max_speed_step, min(max_speed_step, desired_speed - _last_speed))
+    _last_speed += step
+
+    left = int(round(_last_speed))
+    right = int(round(RIGHT_MOTOR_SIGN * _last_speed))
+    return left, right
 
 
 def reset_control():
@@ -231,6 +259,7 @@ def main():
     cv2.createTrackbar("Send Rate Hz", WINDOW_NAME, SEND_RATE_INIT, SEND_RATE_MAX, lambda _: None)
 
     last_send = 0.0
+    left, right = 0, 0
     while True:
         ok, frame = camera.read()
         if not ok:
@@ -244,15 +273,15 @@ def main():
         # Compute control + publish together (rate-limited so we don't flood
         # the broker -- this also paces how often the control loop steps).
         now = time.time()
-        left, right = _last_left_speed, _last_right_speed
         if found is not None:
             conf, cx, cy, (x1, y1, x2, y2) = found
             smoothed_cx = update_smoothed_cx(cx)  # every frame, not gated by SEND_RATE
+            box_width = x2 - x1
 
             send_rate = max(1, cv2.getTrackbarPos("Send Rate Hz", WINDOW_NAME))
             if now - last_send >= 1 / send_rate:
                 last_send = now
-                left, right = control_step(smoothed_cx, w)
+                left, right = control_step(smoothed_cx, box_width, w)
                 msg = {
                     "x": round(smoothed_cx, 1), "y": round(cy, 1), "w": w, "h": h,
                     "conf": round(conf, 2), "left": left, "right": right,
@@ -264,6 +293,8 @@ def main():
             cv2.circle(frame, (int(smoothed_cx), int(cy)), 5, (0, 255, 255), 2)  # smoothed (hollow)
             cv2.putText(frame, f"minifig {conf:.2f}  L{left:+d} R{right:+d}", (int(x1), int(y1) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, BOX_COLOR, 2)
+            cv2.putText(frame, f"box width: {box_width:.0f}px  distance factor: x{_last_distance_factor:.2f}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, BOX_COLOR, 2)
         else:
             reset_control()
             cv2.putText(frame, "no minifig detected", (10, 30),
