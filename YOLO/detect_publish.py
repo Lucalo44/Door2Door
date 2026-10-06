@@ -88,13 +88,21 @@ WINDOW_NAME = "Door-to-door: YOLO minifig detector (q to quit)"
 
 # --- Motor control gains -----------------------------------------------
 # These are just the trackbars' starting positions -- drag the sliders on
-# the preview window to retune live. MAX_SPEED is a hardware ceiling
-# (matches sketch.ino's analogWrite range), not meant to be tuned, so it's
-# not a slider.
-MAX_SPEED = 255
+# the preview window to retune live.
+MAX_SPEED_CEILING = 255  # absolute hardware limit, matches sketch.ino's
+                          # analogWrite range -- not itself a slider,
+                          # just the upper bound for the Max Speed one below
+MAX_SPEED_INIT = 80  # starting ceiling well below the full 255 range, so a
+                      # runaway can't reach full physical speed before the
+                      # UnoQ's own CONTROL_TIMEOUT safety stop (see
+                      # mqtt-minifig-drive/python/main.py) has a chance to
+                      # catch it. Raise this once low-speed control actually
+                      # works -- capping it low doesn't fix a bad gain or
+                      # sign, it just limits how far a mistake can travel
+                      # before the car drives off the track/out of frame.
 DIRECTION_SIGN = 1     # flip to -1 if the car drives away from center
                        # instead of toward it
-RIGHT_MOTOR_SIGN = -1  # placeholder, unconfirmed for this chassis -- the two
+RIGHT_MOTOR_SIGN = 1  # placeholder, unconfirmed for this chassis -- the two
                        # motors are likely mirror-mounted (same as
                        # whistle_soccer.py/apriltag_pd_tracker.py elsewhere
                        # in this repo), so sending the same speed to both
@@ -189,6 +197,7 @@ def control_step(cx, box_width, frame_width):
     kp = cv2.getTrackbarPos("Kp x100", WINDOW_NAME) / 100.0
     kd = cv2.getTrackbarPos("Kd x100", WINDOW_NAME) / 100.0
     min_speed = cv2.getTrackbarPos("Min Speed", WINDOW_NAME)
+    max_speed = cv2.getTrackbarPos("Max Speed", WINDOW_NAME)
     deadzone_pixels = cv2.getTrackbarPos("Deadzone px", WINDOW_NAME)
     max_speed_step = max(1, cv2.getTrackbarPos("Max Step", WINDOW_NAME))
 
@@ -216,7 +225,7 @@ def control_step(cx, box_width, frame_width):
         # Faster the farther off-center it is, slower as it nears the line --
         # but floored at min_speed so it doesn't stall out before actually
         # getting there.
-        magnitude = max(min_speed, min(MAX_SPEED, abs(raw)))
+        magnitude = max(min_speed, min(max_speed, abs(raw)))
         desired_speed = DIRECTION_SIGN * (magnitude if raw >= 0 else -magnitude)
 
     # Slew-limit so the actual command glides toward desired_speed instead of
@@ -252,7 +261,8 @@ def main():
     cv2.namedWindow(WINDOW_NAME)
     cv2.createTrackbar("Kp x100", WINDOW_NAME, int(KP_INIT * 100), int(KP_MAX * 100), lambda _: None)
     cv2.createTrackbar("Kd x100", WINDOW_NAME, int(KD_INIT * 100), int(KD_MAX * 100), lambda _: None)
-    cv2.createTrackbar("Min Speed", WINDOW_NAME, MIN_SPEED_INIT, MAX_SPEED, lambda _: None)
+    cv2.createTrackbar("Min Speed", WINDOW_NAME, MIN_SPEED_INIT, MAX_SPEED_CEILING, lambda _: None)
+    cv2.createTrackbar("Max Speed", WINDOW_NAME, MAX_SPEED_INIT, MAX_SPEED_CEILING, lambda _: None)
     cv2.createTrackbar("Deadzone px", WINDOW_NAME, DEADZONE_PIXELS_INIT, 100, lambda _: None)
     cv2.createTrackbar("Max Step", WINDOW_NAME, MAX_SPEED_STEP_INIT, 50, lambda _: None)
     cv2.createTrackbar("Smoothing x100", WINDOW_NAME, SMOOTHING_INIT, 100, lambda _: None)
