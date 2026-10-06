@@ -50,9 +50,21 @@ os.chdir(Path(__file__).parent)
 MODEL_FILE = "best.pt"
 CAMERA = 0              # 0 = built-in camera; try 1 if it opens your iPhone instead
 CONFIDENCE = 0.5        # ignore detections less sure than this
-SEND_RATE = 10          # MQTT messages per second, max -- also paces the
-                        # control loop below, since a speed is only computed
-                        # right before being sent
+SEND_RATE_INIT = 10    # MQTT messages per second -- also paces the control
+SEND_RATE_MAX = 60     # loop, since a speed is only computed right before
+                        # being sent, and is itself a trackbar (see "Send
+                        # Rate Hz" below): between control updates, the
+                        # motor just holds whatever speed it was last told,
+                        # continuously, for the whole 1/rate gap -- too low
+                        # a rate means the car can overshoot clear past the
+                        # target (and the camera's entire field of view)
+                        # before the next correction ever arrives. Raising
+                        # it shrinks that blind window. There's a natural
+                        # ceiling, though: requesting faster than the
+                        # camera/YOLO pipeline can actually deliver frames
+                        # just makes every frame trigger a control step --
+                        # it can't go faster than that regardless of the
+                        # slider.
 
 BROKER = "broker.hivemq.com"
 PORT = 1883
@@ -206,6 +218,7 @@ def main():
     cv2.createTrackbar("Deadzone px", WINDOW_NAME, DEADZONE_PIXELS_INIT, 100, lambda _: None)
     cv2.createTrackbar("Max Step", WINDOW_NAME, MAX_SPEED_STEP_INIT, 50, lambda _: None)
     cv2.createTrackbar("Smoothing x100", WINDOW_NAME, SMOOTHING_INIT, 100, lambda _: None)
+    cv2.createTrackbar("Send Rate Hz", WINDOW_NAME, SEND_RATE_INIT, SEND_RATE_MAX, lambda _: None)
 
     last_send = 0.0
     while True:
@@ -226,7 +239,8 @@ def main():
             conf, cx, cy, (x1, y1, x2, y2) = found
             smoothed_cx = update_smoothed_cx(cx)  # every frame, not gated by SEND_RATE
 
-            if now - last_send >= 1 / SEND_RATE:
+            send_rate = max(1, cv2.getTrackbarPos("Send Rate Hz", WINDOW_NAME))
+            if now - last_send >= 1 / send_rate:
                 last_send = now
                 left, right = control_step(smoothed_cx, w)
                 msg = {
