@@ -29,9 +29,19 @@ ArduinoApps/mqtt-minifig-drive/python/main.py's CONTROL_TIMEOUT).
 
 Why the control math lives here instead of on the UnoQ: this way, tuning
 the gains below is just editing this file and rerunning it -- no App Lab
-redeploy needed. The Kp/Kd/Max Speed/Deadzone/Max Step/Smoothing trackbars
-on the preview window let you retune live, without even restarting the
-script.
+redeploy needed. The Kp/Kd/Max Speed/Deadzone/Max Step/Smoothing/Pulse ms
+trackbars on the preview window let you retune live, without even
+restarting the script.
+
+Pulse ms shapes the motor into short bursts instead of holding a speed
+continuously for the whole gap between control updates: shortly after each
+nonzero command is published, an explicit stop is published too, timed off
+the camera's own frame loop (so it is not limited to the Send Rate Hz
+cadence). The UnoQ side needs no changes for this at all -- main.py already
+just applies whatever left/right it was last told, so publishing a "go"
+and then a "stop" from here is enough. Keep Pulse ms shorter than the Send
+Rate interval (1000 / Send Rate Hz, in ms) or the next real command will
+usually land before the stop would have mattered.
 
 If it still overshoots with Kd at 0 and Kp low, the cause usually is not
 the gains at all -- it's noise: YOLO's detected box center jitters a few
@@ -78,6 +88,9 @@ SEND_RATE_MAX = 60     # loop, since a speed is only computed right before
                         # just makes every frame trigger a control step --
                         # it can't go faster than that regardless of the
                         # slider.
+PULSE_MS_INIT = 150  # milliseconds a nonzero command runs before an explicit
+PULSE_MS_MAX = 500    # stop is published, shaping continuous holding into
+                      # short bursts instead. See the module docstring.
 
 BROKER = "broker.hivemq.com"
 PORT = 1883
@@ -243,6 +256,7 @@ def reset_control():
 
 
 def main():
+    global _last_speed
     model = YOLO(MODEL_FILE)
     print("Model classes:", model.names)
 
@@ -263,9 +277,12 @@ def main():
     cv2.createTrackbar("Max Step", WINDOW_NAME, MAX_SPEED_STEP_INIT, 50, lambda _: None)
     cv2.createTrackbar("Smoothing x100", WINDOW_NAME, SMOOTHING_INIT, 100, lambda _: None)
     cv2.createTrackbar("Send Rate Hz", WINDOW_NAME, SEND_RATE_INIT, SEND_RATE_MAX, lambda _: None)
+    cv2.createTrackbar("Pulse ms", WINDOW_NAME, PULSE_MS_INIT, PULSE_MS_MAX, lambda _: None)
 
     last_send = 0.0
     left, right = 0, 0
+    last_command_time = 0.0
+    pulse_stop_sent = True
     while True:
         ok, frame = camera.read()
         if not ok:
@@ -293,6 +310,25 @@ def main():
                     "conf": round(conf, 2), "left": left, "right": right,
                 }
                 client.publish(TOPIC, json.dumps(msg))
+                last_command_time = now
+                pulse_stop_sent = (left == 0 and right == 0)
+
+            # Shape the hold into a short burst: shortly after a nonzero
+            # command, publish an explicit stop -- timed off the camera's
+            # own frame loop, not gated by Send Rate, since it needs finer
+            # timing than that. See the module docstring.
+            pulse_ms = cv2.getTrackbarPos("Pulse ms", WINDOW_NAME)
+            if not pulse_stop_sent and (now - last_command_time) * 1000 >= pulse_ms:
+                pulse_stop_sent = True
+                left, right = 0, 0
+                _last_speed = 0.0  # keep the PD slew state matching reality --
+                                   # it did not run through control_step() to
+                                   # get here
+                stop_msg = {
+                    "x": round(smoothed_cx, 1), "y": round(cy, 1), "w": w, "h": h,
+                    "conf": round(conf, 2), "left": 0, "right": 0,
+                }
+                client.publish(TOPIC, json.dumps(stop_msg))
 
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), BOX_COLOR, 2)
             cv2.circle(frame, (int(cx), int(cy)), 5, BOX_COLOR, -1)  # raw detection
