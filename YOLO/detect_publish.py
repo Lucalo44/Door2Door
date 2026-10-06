@@ -1,15 +1,23 @@
 """
-detect_publish.py - watch the laptop camera with our trained YOLO model and
-publish where the minifig is over MQTT.
+detect_publish.py - watch the laptop camera with our trained YOLO model,
+compute motor speeds to center the minifig, and publish both over MQTT.
 
 Single-class model (just "Minifig") -- publishes to one topic:
   ME193/Luca/green
 
-Message (JSON), same format as the professor's MQTT Minifig Monitor:
-  {"x": 412.0, "y": 230.5, "w": 640, "h": 480, "conf": 0.91}
-  x, y = center of the minifig's box in pixels; w, h = camera frame size.
-Nothing is sent for a frame with no detection - the UNO Q decides what to
-do when messages stop arriving.
+Message (JSON):
+  {"x": 412.0, "y": 230.5, "w": 640, "h": 480, "conf": 0.91,
+   "left": -80, "right": 80}
+  x, y = center of the minifig's box in pixels; w, h = camera frame size;
+  left, right = already-PD-controlled signed motor speeds (-255..255).
+Nothing is sent for a frame with no detection - the UnoQ stops the motors
+on its own if messages stop arriving for too long (see
+ArduinoApps/mqtt-minifig-drive/python/main.py's CONTROL_TIMEOUT).
+
+Why the control math lives here instead of on the UnoQ: this way, tuning
+the gains below is just editing this file and rerunning it -- no App Lab
+redeploy needed. The Kp/Kd/Min Speed/Deadzone/Max Step trackbars on the
+preview window let you retune live, without even restarting the script.
 
 Run from this folder:   python detect_publish.py
 Press q in the video window to quit.
@@ -31,12 +39,38 @@ os.chdir(Path(__file__).parent)
 MODEL_FILE = "best.pt"
 CAMERA = 0              # 0 = built-in camera; try 1 if it opens your iPhone instead
 CONFIDENCE = 0.5        # ignore detections less sure than this
-SEND_RATE = 10          # MQTT messages per second, max
+SEND_RATE = 10          # MQTT messages per second, max -- also paces the
+                        # control loop below, since a speed is only computed
+                        # right before being sent
 
 BROKER = "broker.hivemq.com"
 PORT = 1883
 TOPIC = "ME193/Luca/green"
 BOX_COLOR = (0, 200, 0)  # BGR -- green
+
+WINDOW_NAME = "Door-to-door: YOLO minifig detector (q to quit)"
+
+# --- Motor control gains -----------------------------------------------
+# These are just the trackbars' starting positions -- drag the sliders on
+# the preview window to retune live. MAX_SPEED is a hardware ceiling
+# (matches sketch.ino's analogWrite range), not meant to be tuned, so it's
+# not a slider.
+MAX_SPEED = 255
+KP_INIT, KP_MAX = 1.2, 5.0        # PWM per pixel of horizontal error
+KD_INIT, KD_MAX = 0.15, 2.0       # PWM per (pixel/second) of error's rate of change
+MIN_SPEED_INIT = 60    # smallest PWM that reliably overcomes the motors' own
+                        # static friction -- below this they just stall
+                        # instead of creeping closer. Raise if it still
+                        # stalls short of center; lower if it overshoots.
+DEADZONE_PIXELS_INIT = 20  # horizontal error smaller than this (in pixels)
+                            # counts as "centered" -> stop
+MAX_SPEED_STEP_INIT = 15   # max change in commanded PWM per control step --
+                            # caps how fast speed can ramp so it glides
+                            # instead of jumping
+D_SMOOTHING = 0.15  # low-pass filter weight on the derivative term, same
+                     # reasoning as apriltag_seek_tracker.py's D_SMOOTHING
+                     # elsewhere in this repo -- not exposed as a slider,
+                     # rarely needs retuning
 # ------------------------------------------
 
 
@@ -49,6 +83,67 @@ def best_detection(result):
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             best = (conf, (x1 + x2) / 2, (y1 + y2) / 2, (x1, y1, x2, y2))
     return best
+
+
+_prev_error = 0.0
+_have_prev_error = False
+_smoothed_d_error = 0.0
+_last_left_speed = 0
+_last_right_speed = 0
+_prev_control_time = time.monotonic()
+
+
+def _slew(desired_left, desired_right, max_step):
+    global _last_left_speed, _last_right_speed
+    left_step = max(-max_step, min(max_step, desired_left - _last_left_speed))
+    right_step = max(-max_step, min(max_step, desired_right - _last_right_speed))
+    _last_left_speed += left_step
+    _last_right_speed += right_step
+    return int(_last_left_speed), int(_last_right_speed)
+
+
+def control_step(cx, w):
+    """Returns (left_speed, right_speed): a PD controller centering cx
+    within a frame of width w, same structure as apriltag_seek_tracker.py's
+    control loop elsewhere in this repo. Gains are read live from the
+    trackbars on the preview window."""
+    global _prev_error, _have_prev_error, _smoothed_d_error, _prev_control_time
+
+    kp = cv2.getTrackbarPos("Kp x100", WINDOW_NAME) / 100.0
+    kd = cv2.getTrackbarPos("Kd x100", WINDOW_NAME) / 100.0
+    min_speed = cv2.getTrackbarPos("Min Speed", WINDOW_NAME)
+    deadzone_pixels = cv2.getTrackbarPos("Deadzone px", WINDOW_NAME)
+    max_speed_step = max(1, cv2.getTrackbarPos("Max Step", WINDOW_NAME))
+
+    now = time.monotonic()
+    dt = now - _prev_control_time
+    _prev_control_time = now
+
+    frame_center_x = w / 2
+    error = frame_center_x - cx  # positive -> target is left of center
+
+    raw_d_error = 0.0
+    if _have_prev_error and dt > 0:
+        raw_d_error = (error - _prev_error) / dt
+    _smoothed_d_error += D_SMOOTHING * (raw_d_error - _smoothed_d_error)
+    _prev_error = error
+    _have_prev_error = True
+
+    desired = 0.0
+    if abs(error) > deadzone_pixels:
+        raw = kp * error + kd * _smoothed_d_error
+        magnitude = max(min_speed, min(MAX_SPEED, abs(raw)))
+        desired = magnitude if raw >= 0 else -magnitude
+
+    # Turn toward the target (rotate in place): left/right motors get
+    # opposite signs. Swap these if it turns the wrong way.
+    return _slew(-desired, desired, max_speed_step)
+
+
+def reset_control():
+    global _have_prev_error, _smoothed_d_error
+    _have_prev_error = False
+    _smoothed_d_error = 0.0
 
 
 def main():
@@ -64,6 +159,13 @@ def main():
     client.loop_start()
     print(f"Connected to {BROKER}. Publishing to {TOPIC}")
 
+    cv2.namedWindow(WINDOW_NAME)
+    cv2.createTrackbar("Kp x100", WINDOW_NAME, int(KP_INIT * 100), int(KP_MAX * 100), lambda _: None)
+    cv2.createTrackbar("Kd x100", WINDOW_NAME, int(KD_INIT * 100), int(KD_MAX * 100), lambda _: None)
+    cv2.createTrackbar("Min Speed", WINDOW_NAME, MIN_SPEED_INIT, MAX_SPEED, lambda _: None)
+    cv2.createTrackbar("Deadzone px", WINDOW_NAME, DEADZONE_PIXELS_INIT, 100, lambda _: None)
+    cv2.createTrackbar("Max Step", WINDOW_NAME, MAX_SPEED_STEP_INIT, 50, lambda _: None)
+
     last_send = 0.0
     while True:
         ok, frame = camera.read()
@@ -75,27 +177,32 @@ def main():
         result = model(frame, conf=CONFIDENCE, verbose=False)[0]
         found = best_detection(result)
 
-        # Publish (rate-limited so we don't flood the broker)
+        # Compute control + publish together (rate-limited so we don't flood
+        # the broker -- this also paces how often the control loop steps).
         now = time.time()
-        if found is not None and now - last_send >= 1 / SEND_RATE:
-            last_send = now
-            conf, cx, cy, _ = found
-            msg = {"x": round(cx, 1), "y": round(cy, 1), "w": w, "h": h, "conf": round(conf, 2)}
-            client.publish(TOPIC, json.dumps(msg))
-
-        # Draw what we see: center line (the stopping point) and the detection
-        cv2.line(frame, (w // 2, 0), (w // 2, h), (0, 0, 255), 1)
+        left, right = _last_left_speed, _last_right_speed
         if found is not None:
             conf, cx, cy, (x1, y1, x2, y2) = found
+            if now - last_send >= 1 / SEND_RATE:
+                last_send = now
+                left, right = control_step(cx, w)
+                msg = {
+                    "x": round(cx, 1), "y": round(cy, 1), "w": w, "h": h,
+                    "conf": round(conf, 2), "left": left, "right": right,
+                }
+                client.publish(TOPIC, json.dumps(msg))
+
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), BOX_COLOR, 2)
             cv2.circle(frame, (int(cx), int(cy)), 5, BOX_COLOR, -1)
-            cv2.putText(frame, f"minifig {conf:.2f}", (int(x1), int(y1) - 8),
+            cv2.putText(frame, f"minifig {conf:.2f}  L{left:+d} R{right:+d}", (int(x1), int(y1) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, BOX_COLOR, 2)
         else:
+            reset_control()
             cv2.putText(frame, "no minifig detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        cv2.imshow("Door-to-door: YOLO minifig detector (q to quit)", frame)
+        cv2.line(frame, (w // 2, 0), (w // 2, h), (0, 0, 255), 1)
+        cv2.imshow(WINDOW_NAME, frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 

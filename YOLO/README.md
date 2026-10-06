@@ -28,27 +28,36 @@ that isn't available. When it finishes, the trained model is copied to
 `YOLO/best.pt`. The full training output stays in `runs/`, which git
 ignores.
 
-## Detect and publish over MQTT
+## Detect, compute motor speeds, and publish over MQTT
 
-`detect_publish.py` runs `best.pt` on the laptop camera and publishes where
-the minifig is to the `broker.hivemq.com` broker (port 1883) on topic
-`ME193/Luca/green`.
+`detect_publish.py` runs `best.pt` on the laptop camera, computes a PD
+controller's motor speeds to center the minifig, and publishes both to the
+`broker.hivemq.com` broker (port 1883) on topic `ME193/Luca/green`.
 
-Each message is JSON, in the same format as the professor's MQTT Minifig
-Monitor:
+The control math (centering gains, deadzone, slew rate) runs here instead
+of on the UNO Q on purpose: tuning it is then just editing a constant (or
+dragging a trackbar) and rerunning this script, not redeploying to the
+board through App Lab. **Kp/Kd/Min Speed/Deadzone/Max Step trackbars on
+the preview window let you retune live, without even restarting it.**
+
+Each message is JSON, extending the format used by the professor's MQTT
+Minifig Monitor:
 
 ```
-{"x": 412.0, "y": 230.5, "w": 640, "h": 480, "conf": 0.91}
+{"x": 412.0, "y": 230.5, "w": 640, "h": 480, "conf": 0.91, "left": -80, "right": 80}
 ```
 
 `x`, `y` are the center of the minifig's box in pixels and `w`, `h` are
-the camera frame size. Only the single most confident detection in the
-frame is sent, at most 10 times a second. Nothing is sent for a frame
-with no detection, so the UNO Q decides what to do when messages stop
-arriving.
+the camera frame size; `left`/`right` are the already-computed signed
+motor speeds (-255..255) for the UNO Q to apply as-is. Only the single
+most confident detection in the frame is sent, at most 10 times a second.
+Nothing is sent for a frame with no detection -- the UNO Q hard-stops the
+motors on its own if messages stop arriving for too long (see
+`ArduinoApps/mqtt-minifig-drive/python/main.py`'s `CONTROL_TIMEOUT`).
 
-A video window shows the detections and a red line at the center of the
-frame (the stopping point). Press `q` in that window to quit.
+A video window shows the detections, the current left/right speeds, a red
+line at the center of the frame (the stopping point), and the tuning
+trackbars described above. Press `q` in that window to quit.
 
 You must run it from inside this `YOLO` folder:
 

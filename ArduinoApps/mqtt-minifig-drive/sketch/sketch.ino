@@ -1,8 +1,11 @@
 // Mirrors mqtt-minifig-monitor's sketch (Arduino_RouterBridge +
 // Arduino_LED_Matrix) and adds a second Bridge.provide() for driving two
-// motors. All position/control logic lives in python/main.py -- this sketch
-// is a thin executor: it draws whatever frame Python last sent, and drives
-// whatever signed left/right speeds Python last computed.
+// motors. This sketch is a thin executor with no control logic of its own:
+// it draws whatever frame Python last sent, and drives whatever signed
+// left/right speeds Python last sent. The PD control math itself runs even
+// further upstream, on the laptop in Door2Door/YOLO/detect_publish.py --
+// python/main.py here just forwards those speeds (and hard-stops them if
+// messages stop arriving).
 //
 // Motor driver interface (confirmed against the board's own silkscreen,
 // not a datasheet guess): each motor gets two PWM-capable pins and no
@@ -76,7 +79,8 @@ void driveMotor(int pinA, int pinB, int speed) {
 }
 
 // Called from Python with already-PD-controlled signed speeds
-// (-MAX_SPEED..MAX_SPEED) for each motor -- see main.py's control_step().
+// (-MAX_SPEED..MAX_SPEED) for each motor -- computed on the laptop in
+// detect_publish.py's control_step(), forwarded as-is by main.py here.
 void drive(int leftSpeed, int rightSpeed) {
   driveMotor(MOTOR1_A_PIN, MOTOR1_B_PIN, leftSpeed);
   driveMotor(MOTOR2_A_PIN, MOTOR2_B_PIN, rightSpeed);

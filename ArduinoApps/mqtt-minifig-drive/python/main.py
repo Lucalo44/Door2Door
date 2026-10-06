@@ -1,25 +1,27 @@
 """Runs on the UNO Q's Linux/MPU side as the Python half of this Arduino App
-Lab project. Subscribes to the minifig position over MQTT (published by
-Door2Door/YOLO/detect_publish.py), shows it on the LED matrix as a dot, and
-PD-controls two motors to keep it horizontally centered. sketch/sketch.ino
-is a thin executor: all of this logic lives here.
+Lab project. Subscribes to MQTT (published by Door2Door/YOLO/detect_publish.py)
+and acts on it: shows the minifig's position on the LED matrix as a dot, and
+forwards already-computed motor speeds to the sketch. sketch/sketch.ino is a
+thin executor -- it has no control logic of its own.
 
-Broker/topic and the LED frame/staleness handling are copied from
-mqtt-minifig-monitor: {"x": <pixel x>, "y": <pixel y>, "w": <frame width>,
-"h": <frame height>} -- x/y are the detection center in pixel coordinates,
-w/h are the camera frame's own dimensions (used only to normalize x/y into
-the LED grid), not the detection box's size. (detect_publish.py also sends
-a "conf" field; unused here, same as in mqtt-minifig-monitor.) One
-consequence of not having the box's own size: there's no distance-to-target
-proxy, so motor speed isn't scaled by how close the minifig looks -- only
-the horizontal centering error.
+The PD control math (centering the minifig, tuning gains) used to live here,
+but now runs on the laptop in detect_publish.py instead -- that way, tuning
+is just editing a constant (or dragging a trackbar) and rerunning a Python
+script, not redeploying to this board through App Lab. See that file's
+docstring for the reasoning and the message format:
+  {"x", "y", "w", "h", "conf", "left", "right"}
+x/y/w/h are used for the LED display (same as mqtt-minifig-monitor); left/
+right are the signed motor speeds (-255..255) to forward as-is.
+
+This board still owns one piece of control logic: if no message arrives for
+CONTROL_TIMEOUT seconds (laptop crashed, MQTT dropped, camera froze), the
+motors are hard-stopped here regardless of what the last message said --
+driving on stale data is a safety issue a display isn't.
 
 mqtt-minifig-monitor never goes stale on the LED: once a first reading has
 arrived, the marker shrinks (see FRESH_MARKER_SIZE/STALE_MARKER_SIZE/
 STALE_TIMEOUT) but never disappears, so you can always see the last known
-position. The motors behave differently on purpose -- driving on a stale
-reading is a safety issue a display isn't, so CONTROL_TIMEOUT stops them
-separately (see control_step()/stop_control()).
+position.
 """
 
 import json
@@ -42,7 +44,7 @@ MQTT_TOPIC = "ME193/Luca/green"
 FRAME_ROWS = 8
 FRAME_COLS = 13
 PIXEL_BRIGHTNESS = 7  # 0-7, max brightness
-REFRESH_INTERVAL = 0.05  # seconds -- LED redraw / control loop rate
+REFRESH_INTERVAL = 0.05  # seconds -- LED redraw / drive-forwarding rate
 
 # The marker is a FRESH_MARKER_SIZE x FRESH_MARKER_SIZE block right after a
 # reading, shrinking to a single STALE_MARKER_SIZE x STALE_MARKER_SIZE pixel
@@ -52,34 +54,20 @@ FRESH_MARKER_SIZE = 3
 STALE_MARKER_SIZE = 1
 STALE_TIMEOUT = 0.75  # seconds
 
-# --- Motor control -----------------------------------------------------------
-CONTROL_TIMEOUT = 0.75  # seconds -- stop the motors if no fresher reading
-                         # than this arrives. Separate from STALE_TIMEOUT
-                         # above on principle (driving on stale data is a
-                         # safety issue a display isn't), even though they
-                         # currently share the same value.
-MAX_SPEED = 255          # analogWrite ceiling, must match MAX_SPEED in sketch.ino
-MIN_SPEED = 60           # smallest PWM that reliably overcomes the motors'
-                          # own static friction -- below this they just
-                          # stall instead of creeping closer. Raise if it
-                          # still stalls short of center; lower if it
-                          # overshoots.
-DEADZONE_PIXELS = 20      # horizontal error smaller than this (in pixels)
-                          # counts as "centered" -> stop
-MAX_SPEED_STEP = 15       # max change in commanded PWM per loop -- caps how
-                          # fast speed can ramp so it glides instead of
-                          # jumping
-KP = 1.2    # PWM per pixel of horizontal error -- placeholder, retune live
-KD = 0.15   # PWM per (pixel/second) of error's rate of change -- placeholder
-D_SMOOTHING = 0.15  # low-pass filter weight on the derivative term, same
-                     # reasoning as apriltag_seek_tracker.py's D_SMOOTHING
-                     # elsewhere in this repo
+# --- Motor safety -----------------------------------------------------------
+CONTROL_TIMEOUT = 0.75  # seconds -- hard-stop the motors if no fresher
+                         # message than this arrives. Separate from
+                         # STALE_TIMEOUT above on principle (driving on stale
+                         # data is a safety issue a display isn't), even
+                         # though they currently share the same value.
 
 _state_lock = threading.Lock()
 _last_x = None
 _last_y = None
 _last_w = None
 _last_h = None
+_last_left = 0
+_last_right = 0
 _last_seen = 0.0
 
 
@@ -93,9 +81,9 @@ def on_disconnect(client, userdata, rc):
 
 
 def on_message(client, userdata, msg):
-    # Keep this handler fast: just parse and stash the latest position.
+    # Keep this handler fast: just parse and stash the latest message.
     # Messages can arrive at a high rate from a laptop-side YOLO detector.
-    global _last_x, _last_y, _last_w, _last_h, _last_seen
+    global _last_x, _last_y, _last_w, _last_h, _last_left, _last_right, _last_seen
     try:
         text = msg.payload.decode("utf-8", errors="replace")
     except Exception:
@@ -105,6 +93,7 @@ def on_message(client, userdata, msg):
     try:
         data = json.loads(text)
         x, y, w, h = data["x"], data["y"], data["w"], data["h"]
+        left, right = int(data["left"]), int(data["right"])
     except (TypeError, ValueError, KeyError, json.JSONDecodeError):
         return
     if not w or not h:
@@ -112,6 +101,7 @@ def on_message(client, userdata, msg):
 
     with _state_lock:
         _last_x, _last_y, _last_w, _last_h = x, y, w, h
+        _last_left, _last_right = left, right
         _last_seen = time.monotonic()
 
 
@@ -148,78 +138,20 @@ def build_frame():
     return array
 
 
-_prev_error = 0.0
-_have_prev_error = False
-_smoothed_d_error = 0.0
-_last_left_speed = 0
-_last_right_speed = 0
-
-
-def _slew(desired_left, desired_right):
-    global _last_left_speed, _last_right_speed
-    left_step = max(-MAX_SPEED_STEP, min(MAX_SPEED_STEP, desired_left - _last_left_speed))
-    right_step = max(-MAX_SPEED_STEP, min(MAX_SPEED_STEP, desired_right - _last_right_speed))
-    _last_left_speed += left_step
-    _last_right_speed += right_step
-    return int(_last_left_speed), int(_last_right_speed)
-
-
-def control_step(x, w, dt):
-    """Returns (left_speed, right_speed): a PD controller centering x within
-    a frame of width w, same structure as apriltag_seek_tracker.py's control
-    loop elsewhere in this repo (minus the distance-factor term, which needs
-    the detection box's own size -- not available in this payload)."""
-    global _prev_error, _have_prev_error, _smoothed_d_error
-
-    frame_center_x = w / 2
-    error = frame_center_x - x  # positive -> target is left of center
-
-    raw_d_error = 0.0
-    if _have_prev_error and dt > 0:
-        raw_d_error = (error - _prev_error) / dt
-    _smoothed_d_error += D_SMOOTHING * (raw_d_error - _smoothed_d_error)
-    _prev_error = error
-    _have_prev_error = True
-
-    desired = 0.0
-    if abs(error) > DEADZONE_PIXELS:
-        raw = KP * error + KD * _smoothed_d_error
-        magnitude = max(MIN_SPEED, min(MAX_SPEED, abs(raw)))
-        desired = magnitude if raw >= 0 else -magnitude
-
-    # Turn toward the target (rotate in place): left/right motors get
-    # opposite signs. Swap these if it turns the wrong way.
-    return _slew(-desired, desired)
-
-
-def stop_control():
-    global _have_prev_error, _smoothed_d_error
-    _have_prev_error = False
-    _smoothed_d_error = 0.0
-    return _slew(0, 0)  # still slew-limited, so it eases to a stop
-
-
-_prev_time = time.monotonic()
-
-
 def loop():
-    global _prev_time
-    now = time.monotonic()
-    dt = now - _prev_time
-    _prev_time = now
-
     with _state_lock:
-        x, w, last_seen = _last_x, _last_w, _last_seen
+        left, right, last_seen = _last_left, _last_right, _last_seen
 
-    have_target = x is not None and (now - last_seen) <= CONTROL_TIMEOUT
-    if have_target:
-        left, right = control_step(x, w, dt)
+    have_fresh_command = (time.monotonic() - last_seen) <= CONTROL_TIMEOUT
+    if have_fresh_command:
+        Bridge.call("drive", left, right)
     else:
-        left, right = stop_control()
+        # Hard stop -- the laptop already slew-limits normal speed changes,
+        # so there's no "ease down" case to handle here, just "is there a
+        # fresh command or not."
+        Bridge.call("drive", 0, 0)
 
-    Bridge.call("drive", left, right)
     Bridge.call("draw", Frame(build_frame()).to_board_bytes())
-
     time.sleep(REFRESH_INTERVAL)
 
 
