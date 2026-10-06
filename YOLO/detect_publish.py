@@ -16,8 +16,19 @@ ArduinoApps/mqtt-minifig-drive/python/main.py's CONTROL_TIMEOUT).
 
 Why the control math lives here instead of on the UnoQ: this way, tuning
 the gains below is just editing this file and rerunning it -- no App Lab
-redeploy needed. The Kp/Kd/Min Speed/Deadzone/Max Step trackbars on the
-preview window let you retune live, without even restarting the script.
+redeploy needed. The Kp/Kd/Min Speed/Deadzone/Max Step/Smoothing trackbars
+on the preview window let you retune live, without even restarting the
+script.
+
+If it still overshoots with Kd at 0 and Kp low, the cause usually is not
+the gains at all -- it's noise: YOLO's detected box center jitters a few
+pixels frame to frame even for a stationary target, and/or there's real
+lag between a motor command and the camera actually seeing its effect
+(inference time + MQTT round trip + physical motor response). The
+Smoothing trackbar low-pass-filters the raw detected x position itself,
+every camera frame, before it ever reaches the controller -- this damps
+jitter-driven overshoot in a way that lowering Kp/Kd alone cannot, since
+those gains don't distinguish real motion from noise.
 
 Run from this folder:   python detect_publish.py
 Press q in the video window to quit.
@@ -67,6 +78,11 @@ DEADZONE_PIXELS_INIT = 20  # horizontal error smaller than this (in pixels)
 MAX_SPEED_STEP_INIT = 15   # max change in commanded PWM per control step --
                             # caps how fast speed can ramp so it glides
                             # instead of jumping
+SMOOTHING_INIT = 30  # out of 100 -- weight on each new raw x reading when
+                      # low-pass-filtering it (see update_smoothed_cx()).
+                      # Lower = heavier smoothing (less jitter, more lag);
+                      # higher = less smoothing (more responsive, more
+                      # jitter passed through to the controller). 100 = off.
 D_SMOOTHING = 0.15  # low-pass filter weight on the derivative term, same
                      # reasoning as apriltag_seek_tracker.py's D_SMOOTHING
                      # elsewhere in this repo -- not exposed as a slider,
@@ -83,6 +99,25 @@ def best_detection(result):
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             best = (conf, (x1 + x2) / 2, (y1 + y2) / 2, (x1, y1, x2, y2))
     return best
+
+
+_smoothed_cx = None
+
+
+def update_smoothed_cx(cx):
+    """Low-pass filters the detected center-x to damp frame-to-frame jitter
+    before it ever reaches the controller. Called every camera frame (not
+    gated by SEND_RATE like control_step()/publishing are), so it has the
+    full frame rate's worth of samples to average over -- smoothing against
+    only the slower, throttled control-step rate would be much weaker for
+    the same slider value."""
+    global _smoothed_cx
+    smoothing = cv2.getTrackbarPos("Smoothing x100", WINDOW_NAME) / 100.0
+    if _smoothed_cx is None:
+        _smoothed_cx = cx  # snap to the first-ever reading, no artificial ramp-in
+    else:
+        _smoothed_cx += smoothing * (cx - _smoothed_cx)
+    return _smoothed_cx
 
 
 _prev_error = 0.0
@@ -145,9 +180,10 @@ def control_step(cx, w):
 
 
 def reset_control():
-    global _have_prev_error, _smoothed_d_error
+    global _have_prev_error, _smoothed_d_error, _smoothed_cx
     _have_prev_error = False
     _smoothed_d_error = 0.0
+    _smoothed_cx = None  # don't drag a stale average into the next detection
 
 
 def main():
@@ -169,6 +205,7 @@ def main():
     cv2.createTrackbar("Min Speed", WINDOW_NAME, MIN_SPEED_INIT, MAX_SPEED, lambda _: None)
     cv2.createTrackbar("Deadzone px", WINDOW_NAME, DEADZONE_PIXELS_INIT, 100, lambda _: None)
     cv2.createTrackbar("Max Step", WINDOW_NAME, MAX_SPEED_STEP_INIT, 50, lambda _: None)
+    cv2.createTrackbar("Smoothing x100", WINDOW_NAME, SMOOTHING_INIT, 100, lambda _: None)
 
     last_send = 0.0
     while True:
@@ -187,17 +224,20 @@ def main():
         left, right = _last_left_speed, _last_right_speed
         if found is not None:
             conf, cx, cy, (x1, y1, x2, y2) = found
+            smoothed_cx = update_smoothed_cx(cx)  # every frame, not gated by SEND_RATE
+
             if now - last_send >= 1 / SEND_RATE:
                 last_send = now
-                left, right = control_step(cx, w)
+                left, right = control_step(smoothed_cx, w)
                 msg = {
-                    "x": round(cx, 1), "y": round(cy, 1), "w": w, "h": h,
+                    "x": round(smoothed_cx, 1), "y": round(cy, 1), "w": w, "h": h,
                     "conf": round(conf, 2), "left": left, "right": right,
                 }
                 client.publish(TOPIC, json.dumps(msg))
 
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), BOX_COLOR, 2)
-            cv2.circle(frame, (int(cx), int(cy)), 5, BOX_COLOR, -1)
+            cv2.circle(frame, (int(cx), int(cy)), 5, BOX_COLOR, -1)  # raw detection
+            cv2.circle(frame, (int(smoothed_cx), int(cy)), 5, (0, 255, 255), 2)  # smoothed (hollow)
             cv2.putText(frame, f"minifig {conf:.2f}  L{left:+d} R{right:+d}", (int(x1), int(y1) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, BOX_COLOR, 2)
         else:
