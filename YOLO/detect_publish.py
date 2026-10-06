@@ -97,9 +97,13 @@ def _slew(desired_left, desired_right, max_step):
     global _last_left_speed, _last_right_speed
     left_step = max(-max_step, min(max_step, desired_left - _last_left_speed))
     right_step = max(-max_step, min(max_step, desired_right - _last_right_speed))
-    _last_left_speed += left_step
-    _last_right_speed += right_step
-    return int(_last_left_speed), int(_last_right_speed)
+    # Cast back to int on every update (not just the return value) -- += with
+    # a float step would otherwise silently turn these globals into floats,
+    # which broke the ":+d" formatting wherever they're read directly instead
+    # of through this function's return value.
+    _last_left_speed = int(_last_left_speed + left_step)
+    _last_right_speed = int(_last_right_speed + right_step)
+    return _last_left_speed, _last_right_speed
 
 
 def control_step(cx, w):
