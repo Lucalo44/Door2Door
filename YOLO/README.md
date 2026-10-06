@@ -1,8 +1,7 @@
 # YOLO
 
-Trains a YOLOv8 nano model to detect two classes, `green_minifig` and
-`blue_minifig`. It starts from `yolov8n.pt` (pretrained on COCO) and
-fine-tunes it on our own photos.
+Trains a YOLOv8 nano model to detect a single class, `Minifig`. It starts
+from `yolov8n.pt` (pretrained on COCO) and fine-tunes it on our own photos.
 
 ## Dataset
 
@@ -32,12 +31,8 @@ ignores.
 ## Detect and publish over MQTT
 
 `detect_publish.py` runs `best.pt` on the laptop camera and publishes where
-each minifig is to the `broker.hivemq.com` broker (port 1883):
-
-| Minifig | Topic              |
-| ------- | ------------------ |
-| green   | `ME193/Luca/green` |
-| blue    | `ME193/Luca/blue`  |
+the minifig is to the `broker.hivemq.com` broker (port 1883) on topic
+`ME193/Luca/green`.
 
 Each message is JSON, in the same format as the professor's MQTT Minifig
 Monitor:
@@ -47,9 +42,10 @@ Monitor:
 ```
 
 `x`, `y` are the center of the minifig's box in pixels and `w`, `h` are
-the camera frame size. Only the most confident box per color is sent, at
-most 10 times a second. Nothing is sent for a minifig that isn't
-detected, so the UNO Q decides what to do when messages stop arriving.
+the camera frame size. Only the single most confident detection in the
+frame is sent, at most 10 times a second. Nothing is sent for a frame
+with no detection, so the UNO Q decides what to do when messages stop
+arriving.
 
 A video window shows the detections and a red line at the center of the
 frame (the stopping point). Press `q` in that window to quit.

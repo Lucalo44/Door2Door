@@ -1,14 +1,14 @@
 """
 detect_publish.py - watch the laptop camera with our trained YOLO model and
-publish where each minifig is over MQTT.
+publish where the minifig is over MQTT.
 
-  green minifig -> topic ME193/Luca/green
-  blue minifig  -> topic ME193/Luca/blue
+Single-class model (just "Minifig") -- publishes to one topic:
+  ME193/Luca/green
 
 Message (JSON), same format as the professor's MQTT Minifig Monitor:
   {"x": 412.0, "y": 230.5, "w": 640, "h": 480, "conf": 0.91}
   x, y = center of the minifig's box in pixels; w, h = camera frame size.
-Nothing is sent for a minifig that isn't detected - the UNO Q decides what to
+Nothing is sent for a frame with no detection - the UNO Q decides what to
 do when messages stop arriving.
 
 Run from this folder:   python detect_publish.py
@@ -35,23 +35,19 @@ SEND_RATE = 10          # MQTT messages per second, max
 
 BROKER = "broker.hivemq.com"
 PORT = 1883
-TOPICS = {
-    "green_minifig": "ME193/Luca/green",
-    "blue_minifig": "ME193/Luca/blue",
-}
-BOX_COLORS = {"green_minifig": (0, 200, 0), "blue_minifig": (255, 120, 0)}  # BGR
+TOPIC = "ME193/Luca/green"
+BOX_COLOR = (0, 200, 0)  # BGR -- green
 # ------------------------------------------
 
 
-def best_detection_per_class(result, names):
-    """Keep only the most confident box for each class: {class: (conf, cx, cy, box)}."""
-    best = {}
+def best_detection(result):
+    """Keep only the single most confident box in the frame, or None."""
+    best = None
     for box in result.boxes:
-        name = names[int(box.cls)]
         conf = float(box.conf)
-        if name in TOPICS and (name not in best or conf > best[name][0]):
+        if best is None or conf > best[0]:
             x1, y1, x2, y2 = box.xyxy[0].tolist()
-            best[name] = (conf, (x1 + x2) / 2, (y1 + y2) / 2, (x1, y1, x2, y2))
+            best = (conf, (x1 + x2) / 2, (y1 + y2) / 2, (x1, y1, x2, y2))
     return best
 
 
@@ -66,7 +62,7 @@ def main():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.connect(BROKER, PORT, keepalive=30)
     client.loop_start()
-    print(f"Connected to {BROKER}. Publishing to {list(TOPICS.values())}")
+    print(f"Connected to {BROKER}. Publishing to {TOPIC}")
 
     last_send = 0.0
     while True:
@@ -77,25 +73,25 @@ def main():
         h, w = frame.shape[:2]
 
         result = model(frame, conf=CONFIDENCE, verbose=False)[0]
-        found = best_detection_per_class(result, model.names)
+        found = best_detection(result)
 
         # Publish (rate-limited so we don't flood the broker)
         now = time.time()
-        if now - last_send >= 1 / SEND_RATE:
+        if found is not None and now - last_send >= 1 / SEND_RATE:
             last_send = now
-            for name, (conf, cx, cy, _) in found.items():
-                msg = {"x": round(cx, 1), "y": round(cy, 1), "w": w, "h": h, "conf": round(conf, 2)}
-                client.publish(TOPICS[name], json.dumps(msg))
+            conf, cx, cy, _ = found
+            msg = {"x": round(cx, 1), "y": round(cy, 1), "w": w, "h": h, "conf": round(conf, 2)}
+            client.publish(TOPIC, json.dumps(msg))
 
-        # Draw what we see: center line (the stopping point) and each detection
+        # Draw what we see: center line (the stopping point) and the detection
         cv2.line(frame, (w // 2, 0), (w // 2, h), (0, 0, 255), 1)
-        for name, (conf, cx, cy, (x1, y1, x2, y2)) in found.items():
-            color = BOX_COLORS[name]
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            cv2.circle(frame, (int(cx), int(cy)), 5, color, -1)
-            cv2.putText(frame, f"{name} {conf:.2f}", (int(x1), int(y1) - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        if not found:
+        if found is not None:
+            conf, cx, cy, (x1, y1, x2, y2) = found
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), BOX_COLOR, 2)
+            cv2.circle(frame, (int(cx), int(cy)), 5, BOX_COLOR, -1)
+            cv2.putText(frame, f"minifig {conf:.2f}", (int(x1), int(y1) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, BOX_COLOR, 2)
+        else:
             cv2.putText(frame, "no minifig detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 

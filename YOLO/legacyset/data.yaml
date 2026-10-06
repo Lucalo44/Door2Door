@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 2
+names: ['blue_minifig', 'green_minifig']
+
+roboflow:
+  workspace: mohammed-almheiri
+  project: minifigs-dcc72
+  version: 1
+  license: Private
+  url: https://app.roboflow.com/mohammed-almheiri/minifigs-dcc72/1
